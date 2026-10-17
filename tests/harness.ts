@@ -1,7 +1,8 @@
-import { createUserMessage, MessageId , createMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, MessageId , createMessage, AssistantStreamAccumulator, LlmAttemptId, ToolCallId, type AssistantStreamRecord, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { Context } from '@deepseek-ai/cordis'
 import type { Terminal } from '@earendil-works/pi-tui'
 import AgentRegistry, {
+  agentEvents,
   type Agent,
   type AgentCancelCause,
   type AgentOptions,
@@ -18,6 +19,7 @@ import SessionStore, { SessionId, type Session, type SessionHeader, type UserMes
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRegistry, { type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
+import { SessionPersistenceRevision } from '@deepseek-ai/dsh-session-persistence'
 import { createTuiChat, type Config, type TuiRuntime } from '../src/index.ts'
 import { TestSessionQueryEngine } from './session-query.ts'
 import TuiPromptService from '../src/prompt.ts'
@@ -152,17 +154,47 @@ export async function createTuiTestHarness<TerminalType extends Terminal, Exit e
   if (ctx.get('systemPrompt') === undefined) await ctx.plugin(SystemPrompt)
   if (options.sessionPersistence !== undefined) {
     const persistence = options.sessionPersistence
+    // 0.2 exposes one handle-based contract: `list`/`stat` return
+    // `SessionPersistenceSnapshot`s (header plus an opaque revision) and body
+    // reads go through `open(...).read(...)`. The option keeps its historical
+    // `list()`/`load()` shape so the resume suites read naturally; this adapter
+    // is the single place that speaks the new wire format.
+    const listHeaders = async (): Promise<SessionHeader[]> => persistence.list()
+    const loadEvents = persistence.load === undefined
+      ? (id: SessionId) => Promise.reject(new Error(`session "${id}" not found`))
+      : (id: SessionId) => persistence.load!(id)
+    const snapshotOf = (header: SessionHeader) => ({
+      header,
+      revision: SessionPersistenceRevision(`${header.id}@${header.createdAt}`),
+    })
+    // `stat` observes stored metadata only, so it reuses the most recent
+    // listing instead of charging a second `list()` or reading a log; the
+    // resume suites count `list()` and `load()` invocations.
+    let listed: readonly SessionHeader[] = []
     ctx.provide('sessionPersistence', {
-      ...persistence,
-      locate: (meta: SessionHeader) => persistence.locate?.(meta),
-      create: () => Promise.resolve(),
-      append: () => Promise.resolve(),
-      load: persistence.load === undefined
-        ? (id: ReturnType<typeof SessionId>) => Promise.reject(new Error(`session "${id}" not found`))
-        : (id: ReturnType<typeof SessionId>) => persistence.load!(id),
-      inspect: persistence.load === undefined
-        ? (id: ReturnType<typeof SessionId>) => Promise.reject(new Error(`session "${id}" not found`))
-        : (id: ReturnType<typeof SessionId>) => persistence.load!(id),
+      async list() {
+        listed = await listHeaders()
+        return listed.map(snapshotOf)
+      },
+      async stat(id: SessionId) {
+        const found = listed.find(header => header.id === id)
+        return found === undefined ? undefined : snapshotOf(found)
+      },
+      async open(id: SessionId, access: string) {
+        const loaded = await loadEvents(id)
+        return {
+          id: loaded.meta.id,
+          header: loaded.meta,
+          inheritedEventCount: 0,
+          access,
+          read: async () => ({ eventState: 'detached', events: loaded.events }),
+          append: async () => { throw new Error('the test harness persistence is read-only') },
+          flush: async () => {},
+          close: async () => {},
+        }
+      },
+      async create() { throw new Error('the test harness persistence does not create sessions') },
+      async flush() {},
     } as never)
   }
   if (options.mountSessionQuery !== false && ctx.get('sessionQuery') === undefined) {
@@ -228,7 +260,7 @@ export async function createTuiTestHarness<TerminalType extends Terminal, Exit e
       return task(new AbortController().signal)
     },
   }
-  ctx.agents.register(agent)
+  ctx.agents.enter(agent, undefined)
   const controller = createTuiChat(ctx, Object.assign({
     ...options.omitWelcome === true ? {} : { welcome: 'Coding agent ready.' },
     sessionId,
@@ -264,6 +296,35 @@ export function appendUser(session: Session, text: string): void {
   }), { surfaceOp: 'append' })
 }
 
+/**
+ * Publish one live assistant chunk exactly as the loop does in 0.2: a
+ * process-local `agent/assistant-stream` frame, never a durable session event.
+ * The durable log only gains the step's stream at settlement.
+ * @param ctx - Context carrying the scoped agent event bus.
+ * @param agent - The publishing agent.
+ * @param index - Dense zero-based position within the current attempt.
+ * @param time - Publication timestamp shared with the eventual durable stream.
+ * @param chunk - The streamed chunk.
+ */
+export function emitLiveChunk(
+  ctx: Context,
+  agent: Agent,
+  index: number,
+  time: number,
+  chunk: StreamChunk,
+): void {
+  agentEvents(ctx, agent).emit('agent/assistant-stream', {
+    frame: {
+      type: 'chunk',
+      attemptId: LlmAttemptId('live-attempt'),
+      revision: 1,
+      index,
+      time,
+      chunk,
+    },
+  })
+}
+
 /** Append a production-shaped assistant message to the active session surface. */
 export function appendAssistant(
   session: Session,
@@ -271,6 +332,7 @@ export function appendAssistant(
   usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number },
   position: { turn: number; step: number } = { turn: 1, step: 1 },
 ): void {
+  const stream = buildAssistantStream(content, usage)
   session.append('assistant/message', {
     ...position,
     message: createMessage({
@@ -278,6 +340,90 @@ export function appendAssistant(
       content,
       source: { kind: 'model', provider: 'mock', model: 'deepseek-v4-flash' },
     }),
+    stream,
     ...usage === undefined ? {} : { usage },
   }, { surfaceOp: 'append' })
+}
+
+/**
+ * Append one `assistant/message` whose embedded stream is supplied chunk by
+ * chunk, so timing consumers see the exact per-chunk times a real attempt logs.
+ * @param session - Session to append to.
+ * @param position - Turn/step coordinates.
+ * @param chunks - Timed stream chunks in publication order.
+ * @param content - Settled message content; defaults to no blocks.
+ * @param usage - Optional settled usage.
+ */
+export function appendAssistantStream(
+  session: Session,
+  position: { turn: number; step: number },
+  chunks: readonly { time: number; chunk: StreamChunk }[],
+  content: ContentBlock[] = [],
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number },
+): void {
+  const accumulator = new AssistantStreamAccumulator()
+  for (const { time, chunk } of chunks) accumulator.push({ time, chunk })
+  session.append('assistant/message', {
+    ...position,
+    message: createMessage({
+      role: 'assistant',
+      content,
+      source: { kind: 'model', provider: 'mock', model: 'deepseek-v4-flash' },
+    }),
+    stream: accumulator.snapshot(),
+    ...usage === undefined ? {} : { usage },
+  }, { surfaceOp: 'append' })
+}
+
+/**
+ * Append one `assistant/attempt`: a model attempt that settled without
+ * committing a surface message, carrying its own stream (and any usage).
+ * @param session - Session to append to.
+ * @param position - Turn/step coordinates.
+ * @param chunks - Timed stream chunks in publication order.
+ */
+export function appendAssistantAttempt(
+  session: Session,
+  position: { turn: number; step: number },
+  chunks: readonly { time: number; chunk: StreamChunk }[],
+): void {
+  const accumulator = new AssistantStreamAccumulator()
+  for (const { time, chunk } of chunks) accumulator.push({ time, chunk })
+  session.append('assistant/attempt', { ...position, stream: accumulator.snapshot() })
+}
+
+/**
+ * Build a compact assistant stream faithful to `content` so timing and assembly
+ * consumers (which read the durable `stream` rather than re-deriving from the
+ * settled message) see a consistent attempt.
+ */
+export function buildAssistantStream(
+  content: ContentBlock[],
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number },
+): AssistantStreamRecord[] {
+  const accumulator = new AssistantStreamAccumulator()
+  content.forEach((block, index) => {
+    accumulator.push({ time: 0, chunk: { type: 'block-start', index, blockType: block.type } })
+    switch (block.type) {
+      case 'text':
+      case 'reasoning':
+        accumulator.push({ time: 0, chunk: { type: 'text-delta', index, text: block.text } })
+        break
+      case 'tool-call':
+        if (block.name !== '') {
+          accumulator.push({ time: 0, chunk: { type: 'tool-call-delta', index, id: block.id, name: block.name, argumentsDelta: block.arguments } })
+        } else {
+          accumulator.push({ time: 0, chunk: { type: 'tool-call-delta', index, id: block.id, argumentsDelta: block.arguments } })
+        }
+        break
+      default:
+        break
+    }
+    accumulator.push({ time: 0, chunk: { type: 'block-end', index, block } })
+  })
+  if (usage !== undefined) {
+    accumulator.push({ time: 0, chunk: { type: 'usage', usage: { totalTokens: usage.inputTokens + usage.outputTokens, ...usage } } })
+  }
+  accumulator.push({ time: 0, chunk: { type: 'finish', reason: { kind: 'stop' } } })
+  return accumulator.snapshot()
 }

@@ -1,13 +1,37 @@
 import { describe, expect, it } from 'vitest'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import { createAssistantMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { StepTimingTracker } from '../src/chat/timing.ts'
+
+/** One assistant/message event carrying a timed durable stream. */
+function messageEvent(
+  turn: number,
+  step: number,
+  seq: number,
+  time: number,
+  chunks: readonly { time: number; chunk: StreamChunk }[],
+): SessionEvent {
+  return {
+    type: 'assistant/message',
+    seq,
+    time,
+    data: {
+      turn,
+      step,
+      message: createAssistantMessage({ content: [{ type: 'text', text: '' }], source: { provider: 'p', model: 'm' } }),
+      stream: chunks.map(({ time: t, chunk }) => ({ type: 'chunk', time: t, chunk })),
+    },
+  } as SessionEvent
+}
 
 /** One completed two-phase step plus a tool call, in event-log order. */
 function stepEvents(turn: number, step: number, base: number, seq: number): SessionEvent[] {
   return [
     { type: 'step/start', seq: seq, time: base, data: { turn, step } },
-    { type: 'assistant/chunk', seq: seq + 1, time: base + 100, data: { turn, step, chunk: { type: 'block-start', index: 0, blockType: 'reasoning' } } },
-    { type: 'assistant/chunk', seq: seq + 2, time: base + 300, data: { turn, step, chunk: { type: 'text-delta', index: 1, text: 'hi' } } },
+    messageEvent(turn, step, seq + 1, base + 100, [
+      { time: base + 100, chunk: { type: 'block-start', index: 0, blockType: 'reasoning' } },
+      { time: base + 300, chunk: { type: 'text-delta', index: 1, text: 'hi' } },
+    ]),
     { type: 'tool/call', seq: seq + 3, time: base + 450, data: { turn, step, callId: 'call-1', name: 'bash', arguments: '{}' } },
     { type: 'step/end', seq: seq + 4, time: base + 700, data: { turn, step } },
   ] as SessionEvent[]
@@ -57,7 +81,9 @@ describe('StepTimingTracker', () => {
     const events = [
       { type: 'step/start', seq: 0, time: 1_000, data: { turn: 1, step: 1 } },
       { type: 'step/start', seq: 1, time: 1_100, data: { turn: 1, step: 2 } },
-      { type: 'assistant/chunk', seq: 2, time: 1_200, data: { turn: 1, step: 2, chunk: { type: 'text-delta', index: 0, text: 'x' } } },
+      messageEvent(1, 2, 2, 1_200, [
+        { time: 1_200, chunk: { type: 'text-delta', index: 0, text: 'x' } },
+      ]),
       { type: 'step/end', seq: 3, time: 1_500, data: { turn: 1, step: 2 } },
       { type: 'step/end', seq: 4, time: 1_600, data: { turn: 1, step: 1 } },
     ] as SessionEvent[]
@@ -81,7 +107,9 @@ describe('StepTimingTracker', () => {
       // A stray duplicate start and a late chunk reuse the coordinates; the
       // closed step's totals stay pinned.
       { type: 'step/start', seq: 5, time: 9_000, data: { turn: 1, step: 1 } },
-      { type: 'assistant/chunk', seq: 6, time: 9_100, data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'late' } } },
+      messageEvent(1, 1, 6, 9_100, [
+        { time: 9_100, chunk: { type: 'text-delta', index: 0, text: 'late' } },
+      ]),
     ] as SessionEvent[]
     expect(tracker.totalsAt(events, { turn: 1, step: 1 }, 10_000)).toEqual({
       ttft: 100, thinking: 200, responding: 150, tools: 250,

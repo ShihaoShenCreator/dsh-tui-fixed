@@ -7,7 +7,7 @@
  * The agent-loop and TUI rows inject this service before evaluating their
  * own config expressions, so the terminal can never open on the wrong session
  * and `--help` prints without starting an agent.
- * @module @deepseek-ai/dsh-tui/startup
+ * @module @shihaoshen/dsh-tui-fixed/startup
  */
 
 import { randomUUID } from 'node:crypto'

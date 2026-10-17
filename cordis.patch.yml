@@ -70,13 +70,13 @@
         refreshIntervalMs: 900000
 
     - id: tui-prompt
-      name: '@deepseek-ai/dsh-tui/prompt'
+      name: '@shihaoshen/dsh-tui-fixed/prompt'
 
     - id: tui-startup
-      name: '@deepseek-ai/dsh-tui/startup'
+      name: '@shihaoshen/dsh-tui-fixed/startup'
 
     - id: tui
-      name: '@deepseek-ai/dsh-tui'
+      name: '@shihaoshen/dsh-tui-fixed'
       inject: [tuiStartup]
       config:
         sessionId: !!js ctx.tuiStartup.sessionId ?? ctx.tuiStartup.resumeSessionId

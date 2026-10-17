@@ -1,8 +1,8 @@
 /**
  * pi-tui transcript components: the startup banner, user/assistant messages,
- * per-step timing footer, streaming assistant buffer, tool cards, and the todo
- * panel. Each is a pure function of its inputs and the active palette.
- * @module @deepseek-ai/dsh-tui/components/transcript
+ * per-step timing footer, streaming assistant buffer, and tool cards. Each is a
+ * pure function of its inputs and the active palette.
+ * @module @shihaoshen/dsh-tui-fixed/components/transcript
  */
 
 import {
@@ -18,7 +18,8 @@ import {
 import { diffLines as compareLines } from 'diff'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm'
-import type { JsonValue, SessionEvent, TodoItem } from '@deepseek-ai/dsh-session'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type {
   TerminalCallView,
   ToolCallView,
@@ -33,6 +34,7 @@ import { contentText, type ParsedArguments } from './content.ts'
 import {
   formatCompletionTime,
   formatTimingTotals,
+  type LiveTimingLookup,
   type StepPosition,
   type StepTimingTracker,
 } from '../chat/timing.ts'
@@ -231,6 +233,7 @@ class StepTimingComponent extends Container {
     private readonly tracker: StepTimingTracker,
     private readonly now: () => number,
     private readonly palette: Palette,
+    private readonly live?: LiveTimingLookup,
   ) {
     super()
     this.rebuild()
@@ -248,7 +251,12 @@ class StepTimingComponent extends Container {
 
   private rebuild(): void {
     this.clear()
-    const totals = this.tracker.totalsAt(this.events(), this.position, this.completionTime ?? this.now())
+    const totals = this.tracker.totalsAt(
+      this.events(),
+      this.position,
+      this.completionTime ?? this.now(),
+      this.live,
+    )
     const timing = formatTimingTotals(totals, true)
     const header = this.completionTime === undefined
       ? timing
@@ -283,9 +291,10 @@ export class StreamingAssistantComponent extends Container {
     private showReasoning: boolean,
     private readonly palette: Palette,
     private readonly mdTheme: MarkdownTheme,
+    private readonly live?: LiveTimingLookup,
   ) {
     super()
-    this.timing = new StepTimingComponent(position, events, tracker, now, palette)
+    this.timing = new StepTimingComponent(position, events, tracker, now, palette, live)
     this.rebuild()
   }
 
@@ -486,13 +495,17 @@ export class ToolCardComponent extends CachedCardComponent {
   updateResult(event: Extract<SessionEvent, { type: 'tool/result' }>['data']): void {
     this.diffBodyCache = undefined
     this.dropLines()
-    const result = event.message.content[0]
+    const message = event.message
     this.result = {
-      content: [...result.content],
-      isError: result.isError === true,
+      content: [...message.content],
+      isError: message.isError === true,
       ...event.meta !== undefined ? { meta: event.meta } : {},
     }
-    if (this.parsed.valid && this.definition?.presentResult) {
+    this.refreshResultView()
+  }
+
+  private refreshResultView(): void {
+    if (this.parsed.valid && this.definition?.presentResult && this.result !== undefined) {
       try {
         const view = this.definition.presentResult(this.parsed.value, this.result)
         if (view !== undefined) this.resultView = view
@@ -799,17 +812,48 @@ export class ContextCardComponent extends CachedCardComponent {
   }
 }
 
+/**
+ * One plan item. 0.2 keeps `todo/write` as a known event type but no longer
+ * exports the `TodoItem` type from `@deepseek-ai/dsh-session`, so the panel
+ * mirrors the event's structural payload rather than importing it.
+ */
+export interface PlanItem {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+
+/**
+ * Narrow a `todo/write` payload to plan items. The payload crosses a durable
+ * replay boundary, so a foreign or corrupt shape yields no panel at all rather
+ * than a partial one.
+ * @param value - Raw `event.data.todos` value.
+ * @returns The validated items, or `undefined` when the payload is not a list.
+ */
+export function planItems(value: unknown): readonly PlanItem[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const items: PlanItem[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null) return undefined
+    const record = entry as Record<string, unknown>
+    const status = record['status']
+    if (typeof record['content'] !== 'string') return undefined
+    if (status !== 'pending' && status !== 'in_progress' && status !== 'completed') return undefined
+    items.push({ content: record['content'], status })
+  }
+  return items
+}
+
 /** The plan/todo panel rendered above the prompt. */
 export class TodoComponent implements Component {
-  private todos: readonly TodoItem[] = []
+  private todos: readonly PlanItem[] = []
 
   constructor(private readonly palette: Palette) {}
 
   /**
    * Replace the rendered plan items.
-   * @param todos - The current todo items.
+   * @param todos - The current plan items.
    */
-  update(todos: readonly TodoItem[]): void {
+  update(todos: readonly PlanItem[]): void {
     this.todos = todos
   }
 
