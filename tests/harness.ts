@@ -265,6 +265,10 @@ export async function createTuiTestHarness<TerminalType extends Terminal, Exit e
     ...options.omitWelcome === true ? {} : { welcome: 'Coding agent ready.' },
     sessionId,
     theme: { color: false },
+    // Pin the language: the product default follows the process environment,
+    // which would make every assertion depend on the developer's locale. A
+    // suite that exercises another language overrides this through `config`.
+    locale: 'en',
   }, options.config), {
     terminal,
     exit,

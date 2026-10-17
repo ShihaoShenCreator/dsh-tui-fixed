@@ -6,11 +6,21 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import type { Volatile } from '@deepseek-ai/cordis'
 import {
   DEFAULT_FILE_SEARCH_EXCLUDED_DIRECTORIES,
   DEFAULT_FILE_SEARCH_MAX_ENTRIES,
   DEFAULT_FILE_SEARCH_MAX_RESULTS,
 } from './chat/file-autocomplete.ts'
+import {
+  localeSettingOf,
+  LOCALE_IDS,
+  resolveLocale,
+  systemLocale,
+  type LocaleId,
+  type LocaleSetting,
+} from './i18n/locale.ts'
+import { translate } from './i18n/translate.ts'
 
 /** Theme and prompt-template settings for the pi-tui terminal mode. */
 export interface TuiThemeConfig {
@@ -44,6 +54,12 @@ export interface TuiConfig {
   maxResumeOptions?: number
   /** Maximum concurrent cold projection reads in one resume scan. */
   resumeScanConcurrency?: number
+  /** Maximum field rows visible at once in the settings panel. */
+  maxSettingsFields?: number
+  /** Settings panel width in terminal columns. */
+  settingsDialogWidth?: number
+  /** Settings panel maximum height in terminal rows. */
+  settingsDialogMaxHeight?: number
   /** User-question panel width in terminal columns, clamped to the terminal. */
   questionDialogWidth?: number
   /** User-question panel maximum height in terminal rows. */
@@ -62,6 +78,14 @@ export interface TuiConfig {
   fileSearchExcludedDirectories?: string[]
   /** Show the terminal's hardware cursor at the pi editor's IME marker. */
   showHardwareCursor?: boolean
+  /**
+   * Interface language. `auto` (the default) follows the process environment's
+   * `LC_ALL`/`LC_MESSAGES`/`LANG`, then the operating system's own language; an
+   * explicit id pins one shipped locale. The Live setting field means the
+   * Loader hands a running plugin the volatile reference instead of the plain
+   * value, so both shapes are accepted here.
+   */
+  locale?: LocaleSetting | Volatile<LocaleSetting | undefined>
   /** Color and prompt-template settings. */
   theme?: TuiThemeConfig
   /** Terminal window title while the UI is mounted; a logged session title prefixes it. */
@@ -75,6 +99,9 @@ const maxQuestionOptionsSchema = z.number().step(1).min(1).default(8)
 const maxModelOptionsSchema = z.number().step(1).min(1).default(8)
 const maxResumeOptionsSchema = z.number().step(1).min(1).default(8)
 const resumeScanConcurrencySchema = z.number().step(1).min(1).default(4)
+const maxSettingsFieldsSchema = z.number().step(1).min(3).default(10)
+const settingsDialogWidthSchema = z.number().step(1).min(20).default(88)
+const settingsDialogMaxHeightSchema = z.number().step(1).min(8).default(22)
 const questionDialogWidthSchema = z.number().step(1).min(20).default(200)
 const questionDialogMaxHeightSchema = z.number().step(1).min(6).default(20)
 const modelDialogWidthSchema = z.number().step(1).min(20).default(76)
@@ -84,20 +111,29 @@ const fileSearchMaxResultsSchema = z.number().step(1).min(1).default(DEFAULT_FIL
 const fileSearchMaxEntriesSchema = z.number().step(1).min(1).default(DEFAULT_FILE_SEARCH_MAX_ENTRIES)
 const fileSearchExcludedDirectoriesSchema = z.array(z.string()).default([...DEFAULT_FILE_SEARCH_EXCLUDED_DIRECTORIES])
 const showHardwareCursorSchema = z.boolean().default(false)
+// `auto` is the default so a deployment that never names a language still
+// follows the user's environment, the way coreutils and git do. Volatile so the
+// Language row in `/settings` switches a running terminal without a remount.
+const localeSchema = z.union([
+  z.const('auto'),
+  ...LOCALE_IDS.map(id => z.const(id)),
+]).default('auto').volatile()
 const colorSchema = z.boolean().default(true)
 // No default: an unset value auto-detects truecolor from COLORTERM in `apply`.
 const truecolorSchema = z.boolean()
 const DEFAULT_LEFT_PROMPT = '${cwd}${git/worktree}${model}${token_meter/cache_hit_rate}${context}'
 const DEFAULT_RIGHT_PROMPT = '${queued}'
 const DEFAULT_INPUT_PROMPT = '${symbol} ${indicator}'
-const DEFAULT_INPUT_PLACEHOLDER = 'press enter to steer and esc to cancel'
+// No schema default: the placeholder's default text follows the interface
+// language, so it is filled in by `resolveTuiConfig` after the locale resolves.
+const inputPlaceholderSchema = z.string()
 const TuiThemeConfigSchema: z<TuiThemeConfig> = z.object({
   color: colorSchema,
   truecolor: truecolorSchema,
   leftPrompt: z.string().default(DEFAULT_LEFT_PROMPT),
   rightPrompt: z.string().default(DEFAULT_RIGHT_PROMPT),
   inputPrompt: z.string().default(DEFAULT_INPUT_PROMPT),
-  inputPlaceholder: z.string().default(DEFAULT_INPUT_PLACEHOLDER),
+  inputPlaceholder: inputPlaceholderSchema,
 })
 const titleSchema = z.string().default('DeepSeek Harness')
 
@@ -109,6 +145,9 @@ const tuiConfigSchemaFields = {
   maxModelOptions: maxModelOptionsSchema,
   maxResumeOptions: maxResumeOptionsSchema,
   resumeScanConcurrency: resumeScanConcurrencySchema,
+  maxSettingsFields: maxSettingsFieldsSchema,
+  settingsDialogWidth: settingsDialogWidthSchema,
+  settingsDialogMaxHeight: settingsDialogMaxHeightSchema,
   questionDialogWidth: questionDialogWidthSchema,
   questionDialogMaxHeight: questionDialogMaxHeightSchema,
   modelDialogWidth: modelDialogWidthSchema,
@@ -118,12 +157,14 @@ const tuiConfigSchemaFields = {
   fileSearchMaxEntries: fileSearchMaxEntriesSchema,
   fileSearchExcludedDirectories: fileSearchExcludedDirectoriesSchema,
   showHardwareCursor: showHardwareCursorSchema,
+  locale: localeSchema,
   theme: TuiThemeConfigSchema,
   title: titleSchema,
 }
 
 /** Schemastery schema for presentation settings embedded by app bundles. */
-export const TuiConfigSchema: z<TuiConfig> = z.object(tuiConfigSchemaFields)
+export type TuiConfigRaw = Omit<TuiConfig, 'locale'> & { locale?: LocaleSetting | null }
+export const TuiConfigSchema: z<TuiConfigRaw, TuiConfig> = z.object(tuiConfigSchemaFields)
 
 /** Serializable plugin configuration. */
 export interface Config extends TuiConfig {
@@ -141,7 +182,8 @@ export interface Config extends TuiConfig {
 }
 
 /** Schemastery schema for the full plugin configuration. */
-export const Config: z<Config> = z.object({
+export type ConfigRaw = Omit<Config, 'locale'> & { locale?: LocaleSetting | null }
+export const Config: z<ConfigRaw, Config> = z.object({
   welcome: z.string(),
   sessionId: z.string().default('main'),
   initialSkill: z.string(),
@@ -151,6 +193,10 @@ export const Config: z<Config> = z.object({
   maxQuestionOptions: tuiConfigSchemaFields.maxQuestionOptions,
   maxModelOptions: tuiConfigSchemaFields.maxModelOptions,
   maxResumeOptions: tuiConfigSchemaFields.maxResumeOptions,
+  resumeScanConcurrency: tuiConfigSchemaFields.resumeScanConcurrency,
+  maxSettingsFields: tuiConfigSchemaFields.maxSettingsFields,
+  settingsDialogWidth: tuiConfigSchemaFields.settingsDialogWidth,
+  settingsDialogMaxHeight: tuiConfigSchemaFields.settingsDialogMaxHeight,
   questionDialogWidth: tuiConfigSchemaFields.questionDialogWidth,
   questionDialogMaxHeight: tuiConfigSchemaFields.questionDialogMaxHeight,
   modelDialogWidth: tuiConfigSchemaFields.modelDialogWidth,
@@ -160,6 +206,7 @@ export const Config: z<Config> = z.object({
   fileSearchMaxEntries: tuiConfigSchemaFields.fileSearchMaxEntries,
   fileSearchExcludedDirectories: tuiConfigSchemaFields.fileSearchExcludedDirectories,
   showHardwareCursor: tuiConfigSchemaFields.showHardwareCursor,
+  locale: tuiConfigSchemaFields.locale,
   theme: tuiConfigSchemaFields.theme,
   title: tuiConfigSchemaFields.title,
 })
@@ -183,6 +230,9 @@ export interface ResolvedTuiConfig {
   maxModelOptions: number
   maxResumeOptions: number
   resumeScanConcurrency: number
+  maxSettingsFields: number
+  settingsDialogWidth: number
+  settingsDialogMaxHeight: number
   questionDialogWidth: number
   questionDialogMaxHeight: number
   modelDialogWidth: number
@@ -192,6 +242,8 @@ export interface ResolvedTuiConfig {
   fileSearchMaxEntries: number
   fileSearchExcludedDirectories: string[]
   showHardwareCursor: boolean
+  /** Interface language every renderer translates through. */
+  locale: LocaleId
   theme: ResolvedTuiThemeConfig
   title: string
 }
@@ -200,9 +252,18 @@ export interface ResolvedTuiConfig {
  * Apply direct-call defaults after Loader schema validation has normally run.
  *
  * @param config - Deployment-provided terminal presentation settings.
+ * @param env - Environment read when `locale` is `auto`; injectable so a caller
+ *   (or a test) can pin the interface language without touching the process.
+ * @param fallbackLocale - Operating-system language tag read when `env` names no
+ *   locale variable; injectable for the same reason.
  * @returns Complete settings consumed by the TUI renderer.
  */
-export function resolveTuiConfig(config: TuiConfig | undefined): ResolvedTuiConfig {
+export function resolveTuiConfig(
+  config: TuiConfig | undefined,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  fallbackLocale: string = systemLocale(),
+): ResolvedTuiConfig {
+  const locale = resolveLocale(localeSettingOf(config?.locale), env, fallbackLocale)
   return {
     showReasoning: config?.showReasoning ?? true,
     maxToolOutputLines: config?.maxToolOutputLines ?? 6,
@@ -211,6 +272,9 @@ export function resolveTuiConfig(config: TuiConfig | undefined): ResolvedTuiConf
     maxModelOptions: config?.maxModelOptions ?? 8,
     maxResumeOptions: config?.maxResumeOptions ?? 8,
     resumeScanConcurrency: config?.resumeScanConcurrency ?? 4,
+    maxSettingsFields: config?.maxSettingsFields ?? 10,
+    settingsDialogWidth: config?.settingsDialogWidth ?? 88,
+    settingsDialogMaxHeight: config?.settingsDialogMaxHeight ?? 22,
     questionDialogWidth: config?.questionDialogWidth ?? 200,
     questionDialogMaxHeight: config?.questionDialogMaxHeight ?? 20,
     modelDialogWidth: config?.modelDialogWidth ?? 76,
@@ -220,13 +284,14 @@ export function resolveTuiConfig(config: TuiConfig | undefined): ResolvedTuiConf
     fileSearchMaxEntries: config?.fileSearchMaxEntries ?? DEFAULT_FILE_SEARCH_MAX_ENTRIES,
     fileSearchExcludedDirectories: [...(config?.fileSearchExcludedDirectories ?? DEFAULT_FILE_SEARCH_EXCLUDED_DIRECTORIES)],
     showHardwareCursor: config?.showHardwareCursor ?? false,
+    locale,
     theme: {
       color: config?.theme?.color ?? true,
       truecolor: config?.theme?.truecolor ?? false,
       leftPrompt: config?.theme?.leftPrompt ?? DEFAULT_LEFT_PROMPT,
       rightPrompt: config?.theme?.rightPrompt ?? DEFAULT_RIGHT_PROMPT,
       inputPrompt: config?.theme?.inputPrompt ?? DEFAULT_INPUT_PROMPT,
-      inputPlaceholder: config?.theme?.inputPlaceholder ?? DEFAULT_INPUT_PLACEHOLDER,
+      inputPlaceholder: config?.theme?.inputPlaceholder ?? translate(locale, 'prompt.inputPlaceholder'),
     },
     title: config?.title ?? 'DeepSeek Harness',
   }

@@ -38,6 +38,7 @@ import {
   type StepPosition,
   type StepTimingTracker,
 } from '../chat/timing.ts'
+import type { Translator } from '../i18n/translate.ts'
 
 /** Concatenate the text of every block of one type, separated by blank lines. */
 function textBlocks(content: readonly ContentBlock[], type: 'text' | 'reasoning'): string {
@@ -78,7 +79,12 @@ function diffContentLines(text: string): string[] {
  * change totals. Comparisons beyond the edit-distance budget fall back to
  * whole-side rendering so a model-authored pending edit cannot stall the TUI.
  */
-function renderDiff(diff: FileDiff, maxDiffEditLength: number, palette: Palette): RenderedDiff {
+function renderDiff(
+  diff: FileDiff,
+  maxDiffEditLength: number,
+  palette: Palette,
+  t: Translator['t'],
+): RenderedDiff {
   // The card header is a fixed `Tool / <name>` frame that never names a file, so
   // each hunk always carries its own path header (no redundancy to suppress).
   const lines = [palette.bold(displayText(diff.path))]
@@ -94,7 +100,7 @@ function renderDiff(diff: FileDiff, maxDiffEditLength: number, palette: Palette)
   if (changes === undefined) {
     const oldLines = diffContentLines(displayText(diff.oldText))
     const newLines = diffContentLines(displayText(diff.newText))
-    lines.push(palette.dim(`[exact line diff omitted: >${maxDiffEditLength} changed lines]`))
+    lines.push(palette.dim(t('diff.omitted', { limit: maxDiffEditLength })))
     removed = oldLines.length
     added = newLines.length
     for (const line of oldLines) lines.push(palette.error(`- ${line}`))
@@ -178,7 +184,12 @@ export class HeaderComponent implements Component {
  * no prefix or indent, so a terminal drag-select copies the prompt verbatim.
  */
 export class UserMessageComponent extends Container {
-  constructor(text: string, palette: Palette, mdTheme: MarkdownTheme, label = 'You') {
+  constructor(
+    text: string,
+    palette: Palette,
+    mdTheme: MarkdownTheme,
+    label: string,
+  ) {
     super()
     this.addChild(new Text(messageHeader(label, palette.accent, palette), 0, 0))
     this.addChild(new Markdown(displayText(text), 0, 0, mdTheme, { color: value => palette.text(value) }, {
@@ -200,6 +211,7 @@ function assistantMessageChildren(
   foldedContinuation: boolean,
   palette: Palette,
   mdTheme: MarkdownTheme,
+  t: Translator['t'],
 ): Component[] {
   const reasoning = displayText(textBlocks(content, 'reasoning').trim())
   const text = displayText(textBlocks(content, 'text').trim())
@@ -207,11 +219,11 @@ function assistantMessageChildren(
   if (foldedContinuation && !showsReasoning && text === '') return []
   const children: Component[] = [new Spacer(1)]
   if (!foldedContinuation) {
-    children.push(new Text(messageHeader('Assistant', palette.accent, palette), 0, 0))
+    children.push(new Text(messageHeader(t('role.assistant'), palette.accent, palette), 0, 0))
   }
   if (showsReasoning) {
     children.push(
-      new Text(palette.italic(palette.dim('Reasoning')), 0, 0),
+      new Text(palette.italic(palette.dim(t('label.reasoning'))), 0, 0),
       new Markdown(reasoning, 0, 0, mdTheme, { color: value => palette.dim(value), italic: true }),
     )
   }
@@ -233,6 +245,7 @@ class StepTimingComponent extends Container {
     private readonly tracker: StepTimingTracker,
     private readonly now: () => number,
     private readonly palette: Palette,
+    private readonly t: Translator['t'],
     private readonly live?: LiveTimingLookup,
   ) {
     super()
@@ -257,10 +270,10 @@ class StepTimingComponent extends Container {
       this.completionTime ?? this.now(),
       this.live,
     )
-    const timing = formatTimingTotals(totals, true)
+    const timing = formatTimingTotals(totals, this.t, true)
     const header = this.completionTime === undefined
       ? timing
-      : `${timing} · Completed ${formatCompletionTime(this.completionTime)}`
+      : `${timing} · ${this.t('timing.completed', { time: formatCompletionTime(this.completionTime) })}`
     this.addChild(new Text(this.palette.dim(header), 0, 0))
   }
 }
@@ -291,10 +304,11 @@ export class StreamingAssistantComponent extends Container {
     private showReasoning: boolean,
     private readonly palette: Palette,
     private readonly mdTheme: MarkdownTheme,
+    private readonly t: Translator['t'],
     private readonly live?: LiveTimingLookup,
   ) {
     super()
-    this.timing = new StepTimingComponent(position, events, tracker, now, palette, live)
+    this.timing = new StepTimingComponent(position, events, tracker, now, palette, t, live)
     this.rebuild()
   }
 
@@ -398,6 +412,7 @@ export class StreamingAssistantComponent extends Container {
       this.foldedContinuation,
       this.palette,
       this.mdTheme,
+      this.t,
     )
     for (const child of children) this.addChild(child)
   }
@@ -471,6 +486,7 @@ export class ToolCardComponent extends CachedCardComponent {
     private readonly maxDiffEditLength: number,
     private readonly palette: Palette,
     private readonly mdTheme: MarkdownTheme,
+    private readonly t: Translator['t'],
   ) {
     super()
     this.callView = this.presentCall()
@@ -482,7 +498,11 @@ export class ToolCardComponent extends CachedCardComponent {
         const view = this.definition.presentCall(this.parsed.value)
         if (view !== undefined) return view
       } catch (error: unknown) {
-        return { card: 'generic', title: displayText(this.name), rawInput: `Presenter failed: ${String(error)}` }
+        return {
+          card: 'generic',
+          title: displayText(this.name),
+          rawInput: this.t('tool.presenterFailed', { error: String(error) }),
+        }
       }
     }
     return { card: 'generic', title: displayText(this.name), rawInput: this.parsed.value }
@@ -510,7 +530,10 @@ export class ToolCardComponent extends CachedCardComponent {
         const view = this.definition.presentResult(this.parsed.value, this.result)
         if (view !== undefined) this.resultView = view
       } catch (error: unknown) {
-        this.resultView = { card: 'generic', content: [{ type: 'text', text: `Presenter failed: ${String(error)}` }] }
+        this.resultView = {
+          card: 'generic',
+          content: [{ type: 'text', text: this.t('tool.presenterFailed', { error: String(error) }) }],
+        }
       }
     }
   }
@@ -563,7 +586,7 @@ export class ToolCardComponent extends CachedCardComponent {
         text => this.palette.dim(text),
         text => this.palette.dim(text),
         /* v8 ignore next -- renderUnknownXml calls the collapsed summary only when hidden XML children exceed this card's limit. */
-        count => this.palette.dim(`  … +${count} lines (Ctrl+O to expand)`),
+        count => this.palette.dim(`  ${this.t('tool.moreLines', { count })}`),
       )
       : undefined
     // A generic card renders title and result as one Markdown document, so the
@@ -574,7 +597,7 @@ export class ToolCardComponent extends CachedCardComponent {
       : [...rawBody.prelude, ...rawBody.lines])
     const visibleBody = unknownXml !== undefined || this.visibility === 'expanded'
       ? body
-      : preview(body, this.maxOutputLines, count => this.palette.dim(`… +${count} lines (Ctrl+O to expand)`))
+      : preview(body, this.maxOutputLines, count => this.palette.dim(this.t('tool.moreLines', { count })))
     // The header is a fixed `Tool / <name>` frame in the status color (warning
     // pending / success ok / error), flat — no bold or underline, so one color
     // reads consistently across the whole row. Every tool-specific detail (a
@@ -589,7 +612,7 @@ export class ToolCardComponent extends CachedCardComponent {
     // description to an inline escape so it cannot break onto extra rows and
     // collide with the body lines that follow.
     const desc = this.headerDescription()
-    const headerText = `${glyph} Tool / ${displayText(this.name)}${desc === undefined ? '' : ` / ${displayInlineText(desc)}`}`
+    const headerText = `${glyph} ${this.t('tool.header', { name: displayText(this.name) })}${desc === undefined ? '' : ` / ${displayInlineText(desc)}`}`
     const header = truncateToWidth(headerText, Math.max(1, width - 2), '')
     // The blank first row is the card's own paragraph gap (no external Spacer),
     // so the hidden state removes the gap together with the card.
@@ -641,9 +664,11 @@ export class ToolCardComponent extends CachedCardComponent {
       if (pending?.cwd) prelude.push(this.palette.dim(displayInlineText(pending.cwd)))
       if (this.resultView?.card === 'terminal') {
         if (this.resultView.output) lines.push(...this.dimOutput(this.resultView.output))
-        if (this.resultView.exitCode !== undefined) lines.push(this.palette.dim(`[exit ${this.resultView.exitCode}]`))
+        if (this.resultView.exitCode !== undefined) {
+          lines.push(this.palette.dim(this.t('tool.exitCode', { code: this.resultView.exitCode })))
+        }
         if (this.resultView.signal !== undefined) {
-          lines.push(this.palette.error(`[signal ${displayText(this.resultView.signal)}]`))
+          lines.push(this.palette.error(this.t('tool.signal', { name: displayText(this.resultView.signal) })))
         }
       } else if (this.result !== undefined) {
         lines.push(...this.dimOutput(contentText(this.result.content)))
@@ -656,7 +681,7 @@ export class ToolCardComponent extends CachedCardComponent {
       // header. A trailing footer summarizes the exact changed rows when the
       // bounded comparison succeeds (`+A -R · N file(s)`).
       const renderedDiffs = view.diffs.map(diff =>
-        renderDiff(diff, this.maxDiffEditLength, this.palette),
+        renderDiff(diff, this.maxDiffEditLength, this.palette, this.t),
       )
       const added = renderedDiffs.reduce((total, rendered) => total + rendered.added, 0)
       const removed = renderedDiffs.reduce((total, rendered) => total + rendered.removed, 0)
@@ -665,9 +690,11 @@ export class ToolCardComponent extends CachedCardComponent {
         return [...index > 0 ? [''] : [], ...rendered.lines]
       })
       const files = new Set(view.diffs.map(diff => diff.path)).size
-      const footer = this.palette.dim(
-        `└ +${added} -${removed} · ${files} file${files === 1 ? '' : 's'}${approximate ? ' · approximate' : ''}`,
-      )
+      const footer = this.palette.dim(this.t('diff.footer', {
+        added,
+        removed,
+        files: this.t('diff.files', { count: files }),
+      }) + (approximate ? this.t('diff.approximate') : ''))
       // A diff's own `+`/`-` colors carry its meaning, so it renders verbatim
       // rather than under the dim result-output color.
       const body = { prelude: [...hunks, footer], lines: [] }
@@ -784,6 +811,7 @@ export class ContextCardComponent extends CachedCardComponent {
     private readonly text: string,
     private readonly maxOutputLines: number,
     private readonly palette: Palette,
+    private readonly t: Translator['t'],
   ) {
     super()
   }
@@ -798,7 +826,7 @@ export class ContextCardComponent extends CachedCardComponent {
   }
 
   protected renderLines(width: number): string[] {
-    const header = this.palette.dim(`Context · ${displayText(this.label)}`)
+    const header = this.palette.dim(this.t('transcript.contextHeader', { label: displayText(this.label) }))
     // Emptiness is decided on the stripped text: styling a blank body would yield
     // one escape-only row, which reads as a stray blank line under the header.
     const stripped = stripReminderFrame(this.text)
@@ -807,7 +835,7 @@ export class ContextCardComponent extends CachedCardComponent {
       .map(line => line === '' ? line : this.palette.dim(displayText(line)))
     const visibleBody = this.expanded
       ? body
-      : preview(body, this.maxOutputLines, count => this.palette.dim(`… +${count} lines (Ctrl+O to expand)`))
+      : preview(body, this.maxOutputLines, count => this.palette.dim(this.t('tool.moreLines', { count })))
     return [header, ...new Text(visibleBody.join('\n'), 0, 0).render(width)]
   }
 }
@@ -847,7 +875,7 @@ export function planItems(value: unknown): readonly PlanItem[] | undefined {
 export class TodoComponent implements Component {
   private todos: readonly PlanItem[] = []
 
-  constructor(private readonly palette: Palette) {}
+  constructor(private readonly palette: Palette, private readonly t: Translator['t']) {}
 
   /**
    * Replace the rendered plan items.
@@ -861,7 +889,7 @@ export class TodoComponent implements Component {
 
   render(width: number): string[] {
     if (this.todos.length === 0) return []
-    const lines: string[] = [this.palette.bold(this.palette.accent('Plan'))]
+    const lines: string[] = [this.palette.bold(this.palette.accent(this.t('label.plan')))]
     for (const todo of this.todos) {
       const prefix = todo.status === 'completed'
         ? this.palette.success('✓')

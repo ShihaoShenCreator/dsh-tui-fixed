@@ -11,6 +11,7 @@ import {
   launcherEnvironment,
   resolveLauncherInvocation,
 } from '../src/launcher.ts'
+import { createTranslator } from '../src/i18n/translate.ts'
 
 const dirs: string[] = []
 
@@ -174,7 +175,11 @@ describe('resume host', () => {
 
 describe('goodbye message', () => {
   it('names the profile and session id', () => {
-    expect(formatGoodbyeMessage('tui', SessionId('main-session')))
+    expect(formatGoodbyeMessage('tui', SessionId('main-session'), createTranslator('en').t))
       .toBe('To resume this session: dsh --profile tui --resume main-session')
+    // The launcher owns the wording, so the line follows the interface language
+    // the same way every other surface does.
+    expect(formatGoodbyeMessage('tui', SessionId('main-session'), createTranslator('zh').t))
+      .toBe('恢复本会话：dsh --profile tui --resume main-session')
   })
 })

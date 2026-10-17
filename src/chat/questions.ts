@@ -61,7 +61,7 @@ export function createQuestionQueue(deps: QuestionQueueDeps): QuestionQueue {
     pending.overlay = undefined
     removeAbortListener(pending)
     pending.reject(new UserQuestionError(
-      'ask_user_question was interrupted before the user answered',
+      deps.translator.t('question.interrupted'),
       'ASK_ABORTED',
     ))
   }
@@ -102,6 +102,7 @@ export function createQuestionQueue(deps: QuestionQueueDeps): QuestionQueue {
             rejectQuestion(pending)
             startNextQuestion()
           },
+          deps.translator.t,
         ),
         options: {
           width: resolved.questionDialogWidth,

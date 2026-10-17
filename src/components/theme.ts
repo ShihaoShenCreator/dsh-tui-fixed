@@ -10,6 +10,7 @@ import type {
   SelectListTheme,
   TerminalColorScheme,
 } from '@earendil-works/pi-tui'
+import type { TranslationKey, Translator } from '../i18n/translate.ts'
 
 /**
  * Text carrying exactly one palette color. Branded so the compiler rejects
@@ -76,8 +77,8 @@ export interface RoleSpec {
   readonly open: string
   /** SGR parameters that close it; MUST reset every group `open` sets. */
   readonly close: string
-  /** What the role means, shown by `/palette`. */
-  readonly purpose: string
+  /** Translation key naming what the role means; `/palette` renders it in the active language. */
+  readonly purpose: TranslationKey
 }
 
 /**
@@ -103,31 +104,31 @@ export function paletteSpec(scheme: TerminalColorScheme): {
     colors: {
       // The terminal's own foreground, emitted as no escape at all: ordinary body
       // text must inherit whatever the user's theme uses.
-      text: { open: '', close: '', purpose: 'Body text, the terminal default foreground' },
+      text: { open: '', close: '', purpose: 'palette.purpose.text' },
       // SGR 2 over an explicit default foreground, closing both groups it sets.
       // The attribute fades relative to whatever the terminal's own foreground is,
       // which is the only way to land *below* `text` on both schemes: ANSI 90
       // (bright black) is a fixed hue that many light themes render heavier than
       // their default foreground, which made every "dim" surface the most
       // prominent text on screen.
-      dim: { open: '2;39', close: '22;39', purpose: 'The one recessed tone: tool bodies, chrome, footers' },
-      accent: { open: '95', close: '39', purpose: 'The one emphasis color: role headers, prompt, borders' },
-      brand: { open: '34', close: '39', purpose: 'DeepSeek brand art when truecolor is unavailable' },
+      dim: { open: '2;39', close: '22;39', purpose: 'palette.purpose.dim' },
+      accent: { open: '95', close: '39', purpose: 'palette.purpose.accent' },
+      brand: { open: '34', close: '39', purpose: 'palette.purpose.brand' },
       // ANSI 36 (cyan) is difficult to read on a light background — use ANSI 34
       // (blue) which is legible on both light and dark schemes.
       code: scheme === 'light'
-        ? { open: '34', close: '39', purpose: 'Inline code and code blocks in prose' }
-        : { open: '36', close: '39', purpose: 'Inline code and code blocks in prose' },
-      success: { open: '32', close: '39', purpose: 'Succeeded calls, and a diff\'s added lines' },
-      warning: { open: '33', close: '39', purpose: 'Pending calls and warnings' },
-      error: { open: '31', close: '39', purpose: 'Failures, signals, and a diff\'s removed lines' },
+        ? { open: '34', close: '39', purpose: 'palette.purpose.code' }
+        : { open: '36', close: '39', purpose: 'palette.purpose.code' },
+      success: { open: '32', close: '39', purpose: 'palette.purpose.success' },
+      warning: { open: '33', close: '39', purpose: 'palette.purpose.warning' },
+      error: { open: '31', close: '39', purpose: 'palette.purpose.error' },
     },
     attributes: {
-      bold: { open: '1', close: '22', purpose: 'Emphasis; composes with any color' },
-      italic: { open: '3', close: '23', purpose: 'Reasoning text' },
-      underline: { open: '4', close: '24', purpose: 'Role-header banding' },
-      strike: { open: '9', close: '29', purpose: 'Struck-through Markdown' },
-      selected: { open: '7', close: '27', purpose: 'Reverse video for the active selection' },
+      bold: { open: '1', close: '22', purpose: 'palette.purpose.bold' },
+      italic: { open: '3', close: '23', purpose: 'palette.purpose.italic' },
+      underline: { open: '4', close: '24', purpose: 'palette.purpose.underline' },
+      strike: { open: '9', close: '29', purpose: 'palette.purpose.strike' },
+      selected: { open: '7', close: '27', purpose: 'palette.purpose.selected' },
     },
   }
 }
@@ -294,12 +295,14 @@ const PALETTE_SAMPLE = 'The quick brown fox 0123'
  * @param palette - Active role palette, used to paint each sample.
  * @param scheme - Active color scheme, reported in the heading and selecting the spec.
  * @param colorEnabled - Whether ANSI is emitted; reported so an unstyled listing is not confusing.
+ * @param t - Translator supplying the headings and each role's purpose.
  * @returns The rendered rows, without a trailing blank.
  */
 export function renderPalette(
   palette: Palette,
   scheme: TerminalColorScheme,
   colorEnabled: boolean,
+  t: Translator['t'],
 ): string[] {
   const spec = paletteSpec(scheme)
   const width = Math.max(...[...COLOR_ROLES, ...ATTRIBUTE_ROLES].map(name => name.length))
@@ -307,20 +310,23 @@ export function renderPalette(
   // purpose indented under it. Splitting the purpose onto its own row keeps every
   // sample on one visual line at the narrow widths a side-by-side pane gives.
   const head = (name: string, role: RoleSpec, sample: string): string => {
-    const pair = role.open === '' ? 'no escape' : `ESC[${role.open}m ESC[${role.close}m`
+    const pair = role.open === '' ? t('palette.noEscape') : `ESC[${role.open}m ESC[${role.close}m`
     return `  ${sample}  ${palette.dim(`${name.padEnd(width)} ${pair}`)}`
   }
-  const purpose = (role: RoleSpec): string => `  ${palette.dim(`    ${role.purpose}`)}`
+  const purpose = (role: RoleSpec): string => `  ${palette.dim(`    ${t(role.purpose)}`)}`
   const rows = [
-    palette.bold(palette.accent('Palette')),
-    palette.dim(`${scheme} scheme · color ${colorEnabled ? 'on' : 'off'}`),
+    palette.bold(palette.accent(t('palette.title'))),
+    palette.dim(t('palette.subtitle', {
+      scheme,
+      state: t(colorEnabled ? 'palette.colorOn' : 'palette.colorOff'),
+    })),
     '',
-    palette.dim('Colors — exactly one per span; they never nest inside each other.'),
+    palette.dim(t('palette.colorsHeading')),
   ]
   for (const name of COLOR_ROLES) {
     rows.push(head(name, spec.colors[name], palette[name](PALETTE_SAMPLE)), purpose(spec.colors[name]))
   }
-  rows.push('', palette.dim('Attributes — compose with any color, in either order.'))
+  rows.push('', palette.dim(t('palette.attributesHeading')))
   for (const name of ATTRIBUTE_ROLES) {
     rows.push(head(name, spec.attributes[name], palette[name](PALETTE_SAMPLE)), purpose(spec.attributes[name]))
   }

@@ -3,7 +3,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { CombinedAutocompleteProvider, visibleWidth, type Terminal } from '@earendil-works/pi-tui'
+import { CombinedAutocompleteProvider, visibleWidth } from '@earendil-works/pi-tui'
 import AgentRegistry, {
   agentEvents, assembleContextFor, type Agent,
 } from '@deepseek-ai/dsh-agent'
@@ -42,6 +42,7 @@ import {
 } from '../src/index.ts'
 import { WorkspaceFileSearch } from '../src/chat/file-autocomplete.ts'
 import { ResumePicker } from '../src/components/dialogs.ts'
+import { createTranslator } from '../src/i18n/translate.ts'
 import { ATTRIBUTE_ROLES, brandText, COLOR_ROLES, createPalette, paletteSpec } from '../src/components/theme.ts'
 import {
   appendAssistant,
@@ -55,6 +56,7 @@ import {
   type TuiHarnessOptions,
 } from './harness.ts'
 import { HeadlessTerminal } from './headless-terminal.ts'
+import { FakeTerminal } from './fake-terminal.ts'
 import { TestSessionQueryEngine } from './session-query.ts'
 
 const UNUSED_TOOL_OUTPUT: ToolDefinition['output'] = {
@@ -64,76 +66,6 @@ const UNUSED_TOOL_OUTPUT: ToolDefinition['output'] = {
 
 const TEST_COMPACTION_ID = CompactionId('tui-test-compaction')
 const COMPACT_CHECKPOINT_SOURCE = compactCheckpointSource(TEST_COMPACTION_ID)
-
-class FakeTerminal implements Terminal {
-  columns = 88
-  rows = 32
-  kittyProtocolActive = false
-  output = ''
-  title = ''
-  progress: boolean[] = []
-  started = 0
-  stopped = 0
-  drainInput = vi.fn(() => Promise.resolve())
-  private onInput: (data: string) => void = () => {}
-  private onResize: () => void = () => {}
-
-  start(onInput: (data: string) => void, onResize: () => void): void {
-    this.started += 1
-    this.onInput = onInput
-    this.onResize = onResize
-  }
-
-  stop(): void {
-    this.stopped += 1
-  }
-
-  write(data: string): void {
-    this.output += data
-  }
-
-  moveBy(lines: number): void {
-    this.output += `[move:${lines}]`
-  }
-
-  hideCursor(): void {
-    this.output += '[hide]'
-  }
-
-  showCursor(): void {
-    this.output += '[show]'
-  }
-
-  clearLine(): void {
-    this.output += '[clear-line]'
-  }
-
-  clearFromCursor(): void {
-    this.output += '[clear-rest]'
-  }
-
-  clearScreen(): void {
-    this.output += '[clear-screen]'
-  }
-
-  setTitle(title: string): void {
-    this.title = title
-  }
-
-  setProgress(active: boolean): void {
-    this.progress.push(active)
-  }
-
-  send(data: string): void {
-    this.onInput(data)
-  }
-
-  resize(columns: number, rows = this.rows): void {
-    this.columns = columns
-    this.rows = rows
-    this.onResize()
-  }
-}
 
 async function tick(): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, 25))
@@ -202,7 +134,10 @@ function provideLlmCatalog(ctx: Context): void {
 
 describe('TUI config', () => {
   it('defaults every direct-call TUI option', () => {
-    expect(resolveTuiConfig(undefined)).toEqual({
+    // An empty environment plus an empty OS language stands in for a C/POSIX
+    // locale, so the resolved language is English and this assertion does not
+    // depend on the machine running the suite.
+    expect(resolveTuiConfig(undefined, {}, '')).toEqual({
       showReasoning: true,
       maxToolOutputLines: 6,
       maxDiffEditLength: 1000,
@@ -210,6 +145,9 @@ describe('TUI config', () => {
       maxModelOptions: 8,
       maxResumeOptions: 8,
       resumeScanConcurrency: 4,
+      maxSettingsFields: 10,
+      settingsDialogWidth: 88,
+      settingsDialogMaxHeight: 22,
       questionDialogWidth: 200,
       questionDialogMaxHeight: 20,
       modelDialogWidth: 76,
@@ -219,6 +157,7 @@ describe('TUI config', () => {
       fileSearchMaxEntries: 10_000,
       fileSearchExcludedDirectories: ['.git', 'node_modules'],
       showHardwareCursor: false,
+      locale: 'en',
       theme: {
         color: true,
         truecolor: false,
@@ -237,6 +176,9 @@ describe('TUI config', () => {
       maxModelOptions: 4,
       maxResumeOptions: 5,
       resumeScanConcurrency: 2,
+      maxSettingsFields: 4,
+      settingsDialogWidth: 70,
+      settingsDialogMaxHeight: 12,
       questionDialogWidth: 60,
       questionDialogMaxHeight: 14,
       modelDialogWidth: 64,
@@ -248,7 +190,7 @@ describe('TUI config', () => {
       showHardwareCursor: true,
       theme: { color: false, truecolor: true },
       title: 'DSH',
-    })).toEqual({
+    }, {}, '')).toEqual({
       showReasoning: false,
       maxToolOutputLines: 2,
       maxDiffEditLength: 12,
@@ -256,6 +198,9 @@ describe('TUI config', () => {
       maxModelOptions: 4,
       maxResumeOptions: 5,
       resumeScanConcurrency: 2,
+      maxSettingsFields: 4,
+      settingsDialogWidth: 70,
+      settingsDialogMaxHeight: 12,
       questionDialogWidth: 60,
       questionDialogMaxHeight: 14,
       modelDialogWidth: 64,
@@ -265,6 +210,7 @@ describe('TUI config', () => {
       fileSearchMaxEntries: 123,
       fileSearchExcludedDirectories: ['.git', 'generated'],
       showHardwareCursor: true,
+      locale: 'en',
       theme: {
         color: false,
         truecolor: true,
@@ -275,6 +221,17 @@ describe('TUI config', () => {
       },
       title: 'DSH',
     })
+    // `auto` (and an absent value) follows the environment, most specific
+    // variable first, and a non-Chinese tag falls back to English.
+    expect(resolveTuiConfig(undefined, { LANG: 'zh_CN.UTF-8' }).locale).toBe('zh')
+    expect(resolveTuiConfig({ locale: 'auto' }, { LANG: 'en_US.UTF-8' }).locale).toBe('en')
+    expect(resolveTuiConfig(undefined, { LC_ALL: 'zh_CN.UTF-8', LANG: 'en_US.UTF-8' }).locale).toBe('zh')
+    expect(resolveTuiConfig(undefined, { LANG: 'fr_FR.UTF-8' }).locale).toBe('en')
+    // A deployment-provided placeholder is copy, so it wins in every language.
+    expect(resolveTuiConfig({ locale: 'zh', theme: { inputPlaceholder: 'custom' } }, {}).theme.inputPlaceholder)
+      .toBe('custom')
+    // An environment silent on language delegates to the operating system.
+    expect(resolveTuiConfig(undefined, {}, 'zh-CN').locale).toBe('zh')
   })
 })
 
@@ -805,6 +762,7 @@ describe('goodbye message and /resume', () => {
       createPalette(false),
       () => {},
       () => {},
+      createTranslator('en').t,
     )
     picker.focused = true
     picker.handleInput('\r')
@@ -3905,6 +3863,128 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await dispose(result)
   })
 
+  it('changes reasoning effort without changing the model route', async () => {
+    const result = await setup({
+      agentOptions: { provider: 'alpha', model: 'a1' },
+      catalog: {
+        providers: [{ id: 'alpha', name: 'Alpha' }],
+        models: [
+          { provider: 'alpha', id: 'a1', name: 'Alpha One' },
+          { provider: 'alpha', id: 'plain', name: 'Plain Model' },
+        ],
+        resolveModelInfo(provider, model) {
+          const reasoning: LlmModelReasoningInfo | undefined = model === 'a1'
+            ? {
+              efforts: [
+                { id: ReasoningEffortId('low'), name: 'Low' },
+                { id: ReasoningEffortId('high'), name: 'High' },
+                { id: ReasoningEffortId('max'), name: 'Max' },
+              ],
+              defaultEffort: ReasoningEffortId('low'),
+            }
+            : undefined
+          return Promise.resolve({ context: { contextWindow: 200 }, ...reasoning === undefined ? {} : { reasoning } })
+        },
+      },
+    })
+    const run = async (line: string): Promise<void> => {
+      result.terminal.send(line)
+      result.terminal.send('\r')
+      await tick()
+    }
+
+    await run('/effort max')
+    expect(result.terminal.output).toContain('Reasoning effort: Max. New steps will use it.')
+    // The prompt footer carries the effort beside the model, and /status
+    // reports it without re-resolving the unchanged route.
+    expect(result.terminal.output).toContain('a1 max')
+    await run('/status')
+    expect(result.terminal.output).toContain('alpha/a1 (effort max;')
+    const assembly = await result.ctx.systemPrompt.assemble(assembleContextFor(result.agent))
+    expect(assembly.variables).toMatchObject({ provider: 'alpha', model: 'a1' })
+    const seed: LlmCallConfig = { provider: 'alpha', model: 'a1' }
+    await expect(agentEvents(result.ctx, result.agent).waterfall(
+      'agent/request', { turn: 1, step: 0, signal: new AbortController().signal }, () => Promise.resolve(seed),
+    )).resolves.toEqual({ provider: 'alpha', model: 'a1', reasoningEffort: ReasoningEffortId('max') })
+
+    // Display names are accepted case-insensitively; repeating the current
+    // level reports it instead of rewriting the target.
+    const alreadyOutput = result.terminal.output.length
+    await run('/effort Max')
+    expect(result.terminal.output.slice(alreadyOutput)).toContain('Reasoning effort is already Max.')
+
+    // `default` clears the explicit effort, so the next request inherits the
+    // route's own behavior again. Like any target change, it lands on the next
+    // prompt assembly.
+    const clearedOutput = result.terminal.output.length
+    await run('/effort default')
+    expect(result.terminal.output.slice(clearedOutput)).toContain('Reasoning effort: Default. New steps will use it.')
+    await result.ctx.systemPrompt.assemble(assembleContextFor(result.agent))
+    await expect(agentEvents(result.ctx, result.agent).waterfall(
+      'agent/request', { turn: 1, step: 0, signal: new AbortController().signal }, () => Promise.resolve(seed),
+    )).resolves.toEqual({ provider: 'alpha', model: 'a1' })
+    await run('/effort default')
+    expect(result.terminal.output).toContain('Reasoning effort is already Default.')
+
+    // Bare /effort opens the selector seeded on the current level. A second
+    // /effort executed while it is open replaces the overlay instead of
+    // stacking one behind it.
+    await run('/effort')
+    await vi.waitFor(() => { expect(result.terminal.output).toContain('Select reasoning effort') })
+    expect(result.terminal.output).toContain('Default')
+    expect(result.terminal.output).toContain('current')
+    await result.ctx.commands.execute(result.agent, '/effort', [], new AbortController().signal)
+    await tick()
+    // Down from the current row (Default) selects Low, then Enter applies it.
+    result.terminal.send('\x1b[B')
+    result.terminal.send('\r')
+    await vi.waitFor(() => { expect(result.terminal.output).toContain('Reasoning effort: Low. New steps will use it.') })
+
+    // Esc closes without applying anything.
+    await run('/effort')
+    await vi.waitFor(() => { expect(result.terminal.output).toContain('Select reasoning effort') })
+    const beforeCancel = result.terminal.output.length
+    result.terminal.send('\x1b')
+    await tick()
+    expect(result.terminal.output.slice(beforeCancel)).not.toContain('New steps will use it.')
+
+    // Argument validation and a model without reasoning metadata.
+    await run('/effort bogus')
+    expect(result.terminal.output).toContain('Unknown reasoning effort: bogus. Available: Default, Low, High, Max.')
+    await run('/effort too many levels')
+    expect(result.terminal.output).toContain('Usage: /effort')
+    await run('/model alpha/plain')
+    await vi.waitFor(() => { expect(result.terminal.output).toContain('Model selected: alpha/plain') })
+    await run('/effort high')
+    expect(result.terminal.output).toContain('alpha/plain advertises no reasoning efforts.')
+    // Clearing an inherited effort still works on such a route.
+    await run('/effort default')
+    expect(result.terminal.output).toContain('Reasoning effort is already Default.')
+    await dispose(result)
+
+    const unset = await setup({ agentOptions: {} })
+    unset.terminal.send('/effort')
+    unset.terminal.send('\r')
+    await tick()
+    expect(unset.terminal.output).toContain('Model is unset; run /model')
+    await dispose(unset)
+
+    const failed = await setup({
+      agentOptions: { provider: 'alpha', model: 'a1' },
+      catalog: {
+        providers: [{ id: 'alpha', name: 'Alpha' }],
+        models: [{ provider: 'alpha', id: 'a1', name: 'Alpha One' }],
+        resolveModelInfo: () => Promise.reject(new Error('capabilities offline')),
+      },
+    })
+    failed.terminal.send('/effort high')
+    failed.terminal.send('\r')
+    await vi.waitFor(() => {
+      expect(failed.terminal.output).toContain('Could not read model capabilities: capabilities offline')
+    })
+    await dispose(failed)
+  })
+
   it('restores the logged model, keeps an unlisted current model visible, and reports catalog failures', async () => {
     const resumed = await setup({
       agentOptions: { provider: 'alpha', model: 'configured' },
@@ -6541,7 +6621,7 @@ describe('terminal mounting', () => {
     await ctx.plugin({
       inject: ['agents', 'commands', 'userQuestions', 'tools', 'llm', 'tokenMeter', 'tuiPrompt'],
       apply: (pluginCtx: Context) => {
-        mountTui(pluginCtx, { theme: { color: false } }, { terminal, exit: vi.fn() })
+        mountTui(pluginCtx, { theme: { color: false }, locale: 'en' }, { terminal, exit: vi.fn() })
       },
     })
     await tick()
@@ -6694,13 +6774,14 @@ describe('terminal mounting', () => {
     // without a listing entry (or the reverse) fails here rather than silently
     // going unlisted.
     const spec = paletteSpec('dark')
+    const { t } = createTranslator('en')
     for (const name of COLOR_ROLES) {
       expect(printed).toContain(name)
-      expect(printed).toContain(spec.colors[name].purpose)
+      expect(printed).toContain(t(spec.colors[name].purpose))
     }
     for (const name of ATTRIBUTE_ROLES) {
       expect(printed).toContain(name)
-      expect(printed).toContain(spec.attributes[name].purpose)
+      expect(printed).toContain(t(spec.attributes[name].purpose))
     }
 
     // Each row is painted by the role it names, so the listing cannot report one

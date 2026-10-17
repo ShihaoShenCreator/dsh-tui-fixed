@@ -34,6 +34,8 @@ import {
   launcherEnvironment,
   resolveLauncherInvocation,
 } from './launcher.ts'
+import { detectLocale } from './i18n/locale.ts'
+import { createTranslator } from './i18n/translate.ts'
 
 /** Stable Cordis plugin name. */
 export const name = 'tui-startup'
@@ -58,21 +60,22 @@ export interface TuiStartupValues {
 
 /**
  * This app's command: its flags, its description, and its help text.
+ *
+ * The wording follows the process environment rather than the `tui` row's
+ * `locale`: this provider runs before any agent exists, and `--help` must print
+ * without one. A deployment that pins a language in configuration therefore
+ * gets localized help only through its environment — documented in the README.
  * @returns a fresh program, so one process can parse more than once (tests).
  */
 function tuiCommand(): Command {
+  const { t } = createTranslator(detectLocale())
   return new Command()
     .name('dsh --profile tui')
-    .description('Open the interactive terminal UI on a fresh or persisted session.')
-    .helpOption('-h, --help', 'show this help')
-    .option('-r, --resume <session>', 'resume a persisted session by id instead of starting a fresh one')
-    .option('-s, --session <id>', 'use an explicit id for the fresh session')
-    .addHelpText('after', `
-Examples:
-  dsh --profile tui                       start a new session
-  dsh --profile tui --resume <session>    continue a persisted session
-  dsh --profile tui --session review      start a named fresh session
-`)
+    .description(t('startup.description'))
+    .helpOption('-h, --help', t('startup.helpOption'))
+    .option('-r, --resume <session>', t('startup.resumeOption'))
+    .option('-s, --session <id>', t('startup.sessionOption'))
+    .addHelpText('after', t('startup.examples'))
 }
 
 /** The tui flag family, as commander parsed it. */
@@ -87,12 +90,13 @@ interface TuiOptions {
  * @returns the session-bound rows' service value.
  */
 function resolveTuiStartup(program: Command): TuiStartupValues {
+  const { t } = createTranslator(detectLocale())
   const options = program.opts<TuiOptions>()
   if (options.resume !== undefined && options.session !== undefined) {
-    program.error('error: --resume continues an existing session and --session names one to create; pass only one')
+    program.error(t('startup.error.bothSelectors'))
   }
   const selected = options.resume ?? options.session
-  if (selected?.trim() === '') program.error('error: the session id must not be empty')
+  if (selected?.trim() === '') program.error(t('startup.error.emptySessionId'))
   const sessionId = SessionId(selected ?? `session-${randomUUID()}`)
   return options.resume === undefined ? { sessionId } : { resumeSessionId: sessionId }
 }
@@ -119,7 +123,11 @@ function provideLauncherHost(ctx: Context, values: TuiStartupValues): void {
   const sessionId = values.sessionId ?? values.resumeSessionId
   /* v8 ignore next -- exactly one identity is present, as resolveTuiStartup guarantees. */
   if (sessionId !== undefined && absent(TUI_GOODBYE_MESSAGE_KEY)) {
-    ctx.provide(TUI_GOODBYE_MESSAGE_KEY, formatGoodbyeMessage(environment.profile, sessionId))
+    ctx.provide(TUI_GOODBYE_MESSAGE_KEY, formatGoodbyeMessage(
+      environment.profile,
+      sessionId,
+      createTranslator(detectLocale()).t,
+    ))
   }
 }
 

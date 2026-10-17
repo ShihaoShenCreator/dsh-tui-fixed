@@ -23,6 +23,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { TuiResumeHost } from './runtime.ts'
+import type { Translator } from './i18n/translate.ts'
 
 /** How to re-invoke the dsh launcher that booted this profile. */
 export interface LauncherInvocation {
@@ -133,9 +134,15 @@ export function resolveLauncherInvocation(
   return { command: execPath, args: [...execArgv, resolve(dirname(installAnchor), relative)] }
 }
 
-/** The line the TUI prints on exit, naming the command that resumes the session. */
-export function formatGoodbyeMessage(profile: string, sessionId: SessionId): string {
-  return `To resume this session: dsh --profile ${profile} --resume ${sessionId}`
+/**
+ * The line the TUI prints on exit, naming the command that resumes the session.
+ * @param profile - Profile the replacement process boots.
+ * @param sessionId - Session to resume.
+ * @param t - Translator supplying the wording.
+ * @returns The exit line.
+ */
+export function formatGoodbyeMessage(profile: string, sessionId: SessionId, t: Translator['t']): string {
+  return t('goodbye.resume', { profile, session: sessionId })
 }
 
 /** Collaborators for the in-place resume host. */

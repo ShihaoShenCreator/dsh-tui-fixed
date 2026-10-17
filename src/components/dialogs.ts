@@ -33,6 +33,7 @@ import {
   renderTuiPromptTemplate,
   type TuiPromptTemplateToken,
 } from '../prompt.ts'
+import type { TranslationKey, Translator } from '../i18n/translate.ts'
 
 /** A selectable model advertised by a provider, with its display name, description, and reasoning metadata. */
 export interface ModelChoice extends ModelSelection {
@@ -71,10 +72,15 @@ export function compactTargetLabel(target: ModelSelection): string {
  * Resolve the display label for a choice's reasoning effort.
  * @param choice - The model choice carrying advertised reasoning metadata.
  * @param effort - The selected effort, or `undefined` for provider default.
+ * @param t - Translator supplying the default row's name.
  * @returns The effort's display name, `Default`, or `undefined` when the model has no reasoning metadata.
  */
-export function targetReasoningLabel(choice: ModelChoice, effort: ReasoningEffortId | undefined): string | undefined {
-  if (effort === undefined) return choice.reasoning === undefined ? undefined : 'Default'
+export function targetReasoningLabel(
+  choice: ModelChoice,
+  effort: ReasoningEffortId | undefined,
+  t: Translator['t'],
+): string | undefined {
+  if (effort === undefined) return choice.reasoning === undefined ? undefined : t('common.default')
   return choice.reasoning?.efforts.find(candidate => candidate.id === effort)?.name ?? effort
 }
 
@@ -151,11 +157,12 @@ export function formatDiagnosticTime(value: number): string {
 /**
  * Format a pluralized count for a diagnostic row.
  * @param value - Count.
- * @param singular - Singular noun; an `s` is appended for other counts.
+ * @param key - Translation key naming the counted noun (`count.*`).
+ * @param t - Translator supplying the pluralized text.
  * @returns The formatted count.
  */
-export function formatDiagnosticCount(value: number, singular: string): string {
-  return `${String(value)} ${singular}${value === 1 ? '' : 's'}`
+export function formatDiagnosticCount(value: number, key: TranslationKey, t: Translator['t']): string {
+  return t(key, { count: value })
 }
 
 /**
@@ -178,18 +185,24 @@ export class StatusCardComponent implements Component {
   constructor(
     private readonly groups: readonly (readonly StatusCardRow[])[],
     private readonly palette: Palette,
+    /** Card title shown in the top border. */
+    private readonly title: string,
   ) {}
 
   invalidate(): void {}
 
   render(width: number): string[] {
+    // Every measurement here is in terminal columns, not string length: a label
+    // may be translated (and a CJK glyph occupies two columns), so measuring
+    // code units would under-reserve the label column and truncate a Chinese
+    // label to half the columns it needs.
     const labels = this.groups.flatMap(group => group.map(([label]) => `${label}:`))
-    const naturalLabelWidth = Math.max(...labels.map(label => label.length))
+    const naturalLabelWidth = Math.max(...labels.map(label => visibleWidth(label)))
     const naturalBodyWidth = Math.max(...this.groups.flatMap(group => group.map(([, value]) =>
       1 + naturalLabelWidth + 2 + visibleWidth(value))))
     const cardWidth = Math.min(
       Math.max(8, width),
-      Math.max('Session status'.length + 5, naturalBodyWidth + 4),
+      Math.max(visibleWidth(this.title) + 5, naturalBodyWidth + 4),
     )
     const innerWidth = Math.max(1, cardWidth - 4)
     const labelWidth = Math.min(
@@ -211,7 +224,7 @@ export class StatusCardComponent implements Component {
       }
     }
 
-    const title = truncateToWidth('Session status', Math.max(1, cardWidth - 5), '')
+    const title = truncateToWidth(this.title, Math.max(1, cardWidth - 5), '')
     const topTail = '─'.repeat(Math.max(0, cardWidth - visibleWidth(title) - 5))
     const top = `${this.palette.dim('╭─ ')}${this.palette.bold(this.palette.accent(title))}${this.palette.dim(` ${topTail}╮`)}`
     const lines = [top]
@@ -293,6 +306,7 @@ export class ModelDialog implements Component {
     private readonly palette: Palette,
     private readonly done: (selection: ModelDialogSelection) => void,
     private readonly cancel: () => void,
+    private readonly t: Translator['t'],
   ) {
     this.items = new Map()
     this.choices = new Map()
@@ -349,12 +363,12 @@ export class ModelDialog implements Component {
   }
 
   private describeChoice(choice: ModelChoice, isCurrent: boolean): string {
-    const effortLabel = targetReasoningLabel(choice, this.efforts.get(targetLabel(choice)))
+    const effortLabel = targetReasoningLabel(choice, this.efforts.get(targetLabel(choice)), this.t)
     return [
       displayText(choice.modelName),
       ...choice.description === undefined ? [] : [displayText(choice.description)],
       ...effortLabel === undefined ? [] : [displayText(effortLabel)],
-      ...isCurrent ? ['current'] : [],
+      ...isCurrent ? [this.t('common.current')] : [],
     ].join(' — ')
   }
 
@@ -415,14 +429,124 @@ export class ModelDialog implements Component {
     this.filter.focused = true
     const results = this.filteredItems()
     const filterContent = truncateToWidth(this.filter.render(innerWidth).join(''), innerWidth, '')
-    return renderDialog('Select model', [
+    return renderDialog(this.t('model.selectTitle'), [
       filterContent,
       '',
       ...results.length === 0
-        ? [this.palette.dim('  No models match the filter')]
+        ? [this.palette.dim(this.t('model.noMatch'))]
         : this.list.render(innerWidth),
       '',
-      this.palette.dim('type to filter • ↑/↓ move • Shift+Tab reasoning • Enter select • Esc'),
+      this.palette.dim(this.t('model.footer')),
+    ], width, this.palette)
+  }
+}
+
+/** One selectable reasoning effort, including the provider/model default. */
+export interface EffortChoice {
+  /** Adapter-owned effort id, or `undefined` for the provider/model default. */
+  readonly id: ReasoningEffortId | undefined
+  /** Display name shown in selectors and notices. */
+  readonly name: string
+  /** Optional user-facing distinction from otherwise similar efforts. */
+  readonly description?: string
+}
+
+/** Display name for the no-explicit-effort row. */
+export const DEFAULT_EFFORT_NAME = 'Default'
+
+/**
+ * Build the selectable reasoning-effort rows for one model.
+ * @param reasoning - The model's advertised reasoning metadata, absent when it has no selectable effort.
+ * @param t - Translator supplying the default row's name.
+ * @returns The default row first, then the adapter's efforts in its preferred order; empty without metadata.
+ */
+export function effortChoices(
+  reasoning: LlmModelReasoningInfo | undefined,
+  t: Translator['t'],
+): EffortChoice[] {
+  if (reasoning === undefined) return []
+  return [
+    { id: undefined, name: t('common.default') },
+    ...reasoning.efforts.map(effort => ({
+      id: effort.id,
+      name: effort.name,
+      ...effort.description === undefined ? {} : { description: effort.description },
+    })),
+  ]
+}
+
+/**
+ * Resolve the display label of one effort against a model's advertised metadata.
+ * @param reasoning - The model's advertised reasoning metadata.
+ * @param effort - The selected effort, or `undefined` for the provider/model default.
+ * @param t - Translator supplying the default row's name.
+ * @returns The effort's display name, or the raw id when the adapter no longer advertises it.
+ */
+export function effortLabel(
+  reasoning: LlmModelReasoningInfo | undefined,
+  effort: ReasoningEffortId | undefined,
+  t: Translator['t'],
+): string {
+  if (effort === undefined) return t('common.default')
+  return reasoning?.efforts.find(candidate => candidate.id === effort)?.name ?? effort
+}
+
+/** Keyboard reasoning-effort selector rendered as a bordered overlay. */
+export class EffortDialog implements Component {
+  private readonly list: SelectList
+  private readonly choices: Map<string, EffortChoice>
+
+  constructor(
+    choices: readonly EffortChoice[],
+    current: ReasoningEffortId | undefined,
+    maxVisible: number,
+    private readonly palette: Palette,
+    private readonly done: (choice: EffortChoice) => void,
+    cancel: () => void,
+    private readonly t: Translator['t'],
+  ) {
+    this.choices = new Map()
+    const items: SelectItem[] = choices.map((choice) => {
+      // The default row's empty value cannot collide with an adapter id: the
+      // service rejects empty effort ids when it validates model metadata.
+      const value = choice.id === undefined ? '' : String(choice.id)
+      this.choices.set(value, choice)
+      const isCurrent = choice.id === current
+      return {
+        value,
+        label: displayText(choice.name),
+        description: [
+          ...choice.description === undefined ? [] : [displayText(choice.description)],
+          ...isCurrent ? [this.t('common.current')] : [],
+        ].join(' — '),
+      }
+    })
+    this.list = new SelectList(items, maxVisible, dialogSelectTheme(palette))
+    this.list.setSelectedIndex(Math.max(0, choices.findIndex(choice => choice.id === current)))
+    this.list.onSelect = (item) => {
+      const choice = this.choices.get(item.value)
+      /* v8 ignore next -- SelectList only returns values built from `choices`. */
+      if (choice === undefined) return
+      this.done(choice)
+    }
+    this.list.onCancel = cancel
+  }
+
+  invalidate(): void {
+    this.list.invalidate()
+  }
+
+  handleInput(data: string): void {
+    this.list.handleInput(data)
+    this.invalidate()
+  }
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(1, width - 4)
+    return renderDialog(this.t('effort.selectTitle'), [
+      ...this.list.render(innerWidth),
+      '',
+      this.palette.dim(this.t('effort.footer')),
     ], width, this.palette)
   }
 }
@@ -434,6 +558,12 @@ export interface DetailsSelection {
 }
 
 const TOOL_CARD_PHASES: readonly ToolCardVisibility[] = ['collapsed', 'expanded', 'hidden']
+
+export const TOOL_CARD_PHASE_KEYS = {
+  collapsed: 'details.phase.collapsed',
+  expanded: 'details.phase.expanded',
+  hidden: 'details.phase.hidden',
+} as const satisfies Record<ToolCardVisibility, TranslationKey>
 
 /**
  * Keyboard toggle over the two transcript-detail entries — tool-card
@@ -452,15 +582,20 @@ export class DetailsDialog implements Component {
     private readonly palette: Palette,
     private readonly apply: (selection: DetailsSelection) => void,
     private readonly close: () => void,
+    private readonly t: Translator['t'],
   ) {
-    this.toolsItem = { value: 'tools', label: 'Tool cards', description: visibility }
-    this.reasoningItem = { value: 'reasoning', label: 'Reasoning', description: this.reasoningLabel() }
+    this.toolsItem = { value: 'tools', label: t('details.toolCards'), description: this.visibilityLabel() }
+    this.reasoningItem = { value: 'reasoning', label: t('details.reasoning'), description: this.reasoningLabel() }
     this.list = new SelectList([this.toolsItem, this.reasoningItem], 2, dialogSelectTheme(palette))
     this.list.onSelect = close
   }
 
+  private visibilityLabel(): string {
+    return this.t(TOOL_CARD_PHASE_KEYS[this.visibility])
+  }
+
   private reasoningLabel(): string {
-    return this.showReasoning ? 'shown' : 'hidden'
+    return this.t(this.showReasoning ? 'common.shown' : 'common.hidden')
   }
 
   /** Cycle the highlighted entry one step and apply the new state. */
@@ -471,7 +606,7 @@ export class DetailsDialog implements Component {
     if (selected.value === 'tools') {
       const index = TOOL_CARD_PHASES.indexOf(this.visibility)
       this.visibility = TOOL_CARD_PHASES[(index + 1) % TOOL_CARD_PHASES.length] as ToolCardVisibility
-      this.toolsItem.description = this.visibility
+      this.toolsItem.description = this.visibilityLabel()
     } else {
       this.showReasoning = !this.showReasoning
       this.reasoningItem.description = this.reasoningLabel()
@@ -492,10 +627,10 @@ export class DetailsDialog implements Component {
 
   render(width: number): string[] {
     const innerWidth = Math.max(1, width - 4)
-    return renderDialog('Transcript details', [
+    return renderDialog(this.t('details.title'), [
       ...this.list.render(innerWidth),
       '',
-      this.palette.dim('↑/↓ move • Tab toggle • Enter/Esc close'),
+      this.palette.dim(this.t('details.footer')),
     ], width, this.palette)
   }
 }
@@ -527,6 +662,7 @@ export interface ResumeCandidate {
  * @param currentId - The current session id.
  * @param cwd - The CURRENT session's workspace, which decides the picker scope this row falls in.
  * @param formatWorkspace - Renders THIS record's own cwd as its prompt-style label.
+ * @param t - Translator supplying the row's own copy.
  * @returns The summarized resume candidate.
  */
 export function summarizeResumeCandidate(
@@ -536,14 +672,15 @@ export function summarizeResumeCandidate(
   currentId: SessionId,
   cwd: string | undefined,
   formatWorkspace: (cwd: string | undefined) => string,
+  t: Translator['t'],
 ): ResumeCandidate {
   let disabledReason: string | undefined
-  if (record.header.id === currentId) disabledReason = 'current session'
-  else if (record.live) disabledReason = 'session is already live in this runtime'
-  else if (record.header.cwd === undefined) disabledReason = 'session has no recorded workspace'
+  if (record.header.id === currentId) disabledReason = t('resume.disabled.current')
+  else if (record.live) disabledReason = t('resume.disabled.live')
+  else if (record.header.cwd === undefined) disabledReason = t('resume.disabled.noWorkspace')
   return {
     record,
-    title: title ?? 'Untitled session',
+    title: title ?? t('resume.untitled'),
     lastActivityAt: lastActivityAt ?? record.header.createdAt,
     currentWorkspace: record.header.cwd === cwd,
     workspaceLabel: formatWorkspace(record.header.cwd),
@@ -583,6 +720,7 @@ export class ResumePicker implements Component, Focusable {
     private readonly palette: Palette,
     private readonly done: (candidate: ResumeCandidate) => void,
     private readonly cancel: () => void,
+    private readonly t: Translator['t'],
   ) {
     this.candidates = candidates
   }
@@ -690,8 +828,8 @@ export class ResumePicker implements Component, Focusable {
       this.error = ''
     } else if (matchesKey(data, Key.enter)) {
       const selected = filtered[this.selectedIndex]
-      if (this.candidates === undefined) this.error = 'Sessions are still loading.'
-      else if (selected === undefined) this.error = 'No session matches this search.'
+      if (this.candidates === undefined) this.error = this.t('resume.searchLoading')
+      else if (selected === undefined) this.error = this.t('resume.searchNoMatch')
       else if (selected.disabledReason !== undefined) this.error = selected.disabledReason
       else this.done(selected)
     } else {
@@ -714,11 +852,11 @@ export class ResumePicker implements Component, Focusable {
     const candidates = this.candidates ?? []
     const inWorkspace = candidates.filter(candidate => candidate.currentWorkspace).length
     const active = this.scope === 'workspace'
-      ? `this workspace ${displayText(this.workspaceLabel)}`
-      : `all workspaces (${candidates.length})`
+      ? this.t('resume.scope.thisWorkspace', { label: displayText(this.workspaceLabel) })
+      : this.t('resume.scope.allWorkspaces', { count: candidates.length })
     const other = this.scope === 'workspace'
-      ? `all workspaces (${candidates.length})`
-      : `this workspace (${inWorkspace})`
+      ? this.t('resume.scope.allWorkspaces', { count: candidates.length })
+      : this.t('resume.scope.thisWorkspaceCount', { count: inWorkspace })
     return `${this.palette.accent(active)}${this.palette.dim(`  ⇥ ${other}`)}`
   }
 
@@ -733,8 +871,8 @@ export class ResumePicker implements Component, Focusable {
     const selected = filtered[this.selectedIndex]
     const position = selected === undefined ? 0 : this.selectedIndex + 1
     const title = this.candidates === undefined
-      ? 'Resume session'
-      : `Resume session (${position} of ${filtered.length})`
+      ? this.t('resume.title')
+      : this.t('resume.titlePositioned', { position, total: filtered.length })
     const lines: string[] = [
       '',
       `${indent}${this.palette.bold(this.palette.accent(title))}`,
@@ -749,7 +887,9 @@ export class ResumePicker implements Component, Focusable {
       `${indent}${this.palette.dim('│')} ${clippedSearch}${' '.repeat(Math.max(0, searchInnerWidth - visibleWidth(clippedSearch)))} ${this.palette.dim('│')}`,
       `${indent}${this.palette.dim(`╰${'─'.repeat(Math.max(0, contentWidth - 2))}╯`)}`,
       '',
-      `${indent}${this.renderScopeLine()}`,
+      // The scope line names two translated phrases, so it is truncated to the
+      // content width like every other row rather than trusted to fit.
+      `${indent}${truncateToWidth(this.renderScopeLine(), contentWidth, '…')}`,
       '',
     )
 
@@ -766,9 +906,9 @@ export class ResumePicker implements Component, Focusable {
       const candidate = filtered[index] as ResumeCandidate
       const active = index === this.selectedIndex
       const status = [
-        candidate.disabledReason === 'current session' ? 'current' : undefined,
-        candidate.record.live ? 'live' : undefined,
-        candidate.record.persisted ? 'persisted' : undefined,
+        candidate.disabledReason === this.t('resume.disabled.current') ? this.t('resume.state.current') : undefined,
+        candidate.record.live ? this.t('resume.state.live') : undefined,
+        candidate.record.persisted ? this.t('resume.state.persisted') : undefined,
       ].filter((value): value is string => value !== undefined).join(' · ')
       const lead = `${active ? '❯' : ' '} ${displayText(candidate.title)}`
       push(active ? this.palette.bold(this.palette.accent(lead)) : lead)
@@ -776,20 +916,22 @@ export class ResumePicker implements Component, Focusable {
       // Only the all-workspaces scope mixes directories, so the per-row
       // workspace is redundant in the scope that already names one.
       if (this.scope === 'all') {
-        push(this.palette.dim(`  workspace ${displayText(candidate.workspaceLabel)}`))
+        push(this.palette.dim(`  ${this.t('resume.row.workspace', { label: displayText(candidate.workspaceLabel) })}`))
       }
       if (candidate.disabledReason !== undefined) {
-        push(this.palette.warning(`  unavailable: ${displayText(candidate.disabledReason)}`))
+        push(this.palette.warning(`  ${this.t('resume.row.unavailable', { reason: displayText(candidate.disabledReason) })}`))
       }
     }
-    if (this.candidates === undefined) push(this.palette.dim('Loading sessions…'))
-    else if (filtered.length === 0) push(this.palette.warning('No matching sessions.'))
+    if (this.candidates === undefined) push(this.palette.dim(this.t('resume.loading')))
+    else if (filtered.length === 0) push(this.palette.warning(this.t('resume.noMatch')))
     if (this.error !== '') {
       lines.push('')
       push(this.palette.error(displayText(this.error)))
     }
 
-    const footer = `${indent}${this.palette.dim('Type to search  •  ↑/↓ navigate  •  Tab scope  •  Enter resume  •  Esc clear/cancel')}`
+    // The footer lists translated controls, so it truncates to the width rather
+    // than overflowing the full-viewport frame on a narrow terminal.
+    const footer = `${indent}${this.palette.dim(truncateToWidth(this.t('resume.footer'), contentWidth, '…'))}`
     while (lines.length < height - 2) lines.push('')
     lines.push(footer, '')
     return lines.slice(0, height)
@@ -824,6 +966,7 @@ export class QuestionDialog implements Component, Focusable {
     private readonly palette: Palette,
     private readonly done: (selection: QuestionSelection) => void,
     private readonly cancel: () => void,
+    private readonly t: Translator['t'],
   ) {
     this.options = question.options ?? []
     this.mode = this.options.length > 0 ? 'options' : 'custom'
@@ -873,7 +1016,7 @@ export class QuestionDialog implements Component, Focusable {
         : [options[this.selectedIndex]?.label].filter((label): label is string => label !== undefined)
       const custom = this.question.multiSelect ? this.input.getValue().trim() : ''
       if (selected.length === 0 && custom === '') {
-        this.error = 'Select at least one option, or press Tab for a custom answer.'
+        this.error = this.t('question.errorSelectOne')
         return
       }
       this.done({ selected, ...(custom === '' ? {} : { custom }) })
@@ -889,7 +1032,7 @@ export class QuestionDialog implements Component, Focusable {
   private submitCustom(value: string): void {
     const custom = value.trim()
     if (custom === '') {
-      this.error = 'Enter an answer before submitting.'
+      this.error = this.t('question.errorEmptyAnswer')
       return
     }
     this.done({
@@ -946,7 +1089,14 @@ export class QuestionDialog implements Component, Focusable {
     this.input.focused = this.focused
     const horizontalPadding = Math.min(2, Math.max(0, Math.floor((width - 1) / 2)))
     const innerWidth = Math.max(1, width - horizontalPadding * 2)
-    const header = `Question ${this.position}/${this.total} (${this.unanswered} unanswered)${this.question.header === undefined ? '' : ` · ${displayText(this.question.header)}`}`
+    const header = this.question.header === undefined
+      ? this.t('question.header', { position: this.position, total: this.total, unanswered: this.unanswered })
+      : this.t('question.headerTitled', {
+        position: this.position,
+        total: this.total,
+        unanswered: this.unanswered,
+        title: displayText(this.question.header),
+      })
     const questionLines = wrapTextWithAnsi(
       this.palette.text(displayText(this.question.question)),
       innerWidth,
@@ -969,9 +1119,11 @@ export class QuestionDialog implements Component, Focusable {
     headerLines.push('')
 
     const customControls = [
-      ...(this.options.length > 0 && this.question.multiSelect ? [`${this.selected.size} selected`] : []),
-      'Enter submit',
-      this.options.length > 0 ? 'Esc options' : 'Esc cancel',
+      ...(this.options.length > 0 && this.question.multiSelect
+        ? [this.t('question.selectedCount', { count: this.selected.size })]
+        : []),
+      this.t('question.enterSubmit'),
+      this.options.length > 0 ? this.t('question.escOptions') : this.t('question.escCancel'),
     ]
     const customHint = this.palette.dim(customControls.join(' • '))
     const footerLines: string[] = []
@@ -980,11 +1132,11 @@ export class QuestionDialog implements Component, Focusable {
       for (const line of wrapTextWithAnsi(customHint, innerWidth)) footerLines.push(line)
     } else {
       const controls = [
-        'Tab custom answer',
-        ...(this.options.length > 1 ? ['↑/↓ navigate'] : []),
-        ...(this.question.multiSelect ? ['Space toggle'] : []),
-        'Enter submit',
-        'Esc interrupt',
+        this.t('question.tabCustom'),
+        ...(this.options.length > 1 ? [this.t('question.navigate')] : []),
+        ...(this.question.multiSelect ? [this.t('question.spaceToggle')] : []),
+        this.t('question.enterSubmit'),
+        this.t('question.escInterrupt'),
       ]
       const hint = this.palette.dim(controls.join(' • '))
       for (const line of wrapTextWithAnsi(hint, innerWidth)) footerLines.push(line)
@@ -1012,11 +1164,11 @@ export class QuestionDialog implements Component, Focusable {
     } else {
       const optionBlocks = this.options.map((option, index) => this.renderOptionBlock(option, index, innerWidth))
       const { visibleBlocks, hiddenBefore, hiddenAfter } = this.windowBlocks(optionBlocks, availableForOptions, innerWidth)
-      if (hiddenBefore > 0) optionLines.push(this.palette.dim(`↑ ${hiddenBefore} more`))
+      if (hiddenBefore > 0) optionLines.push(this.palette.dim(this.t('question.moreAbove', { count: hiddenBefore })))
       for (const block of visibleBlocks) {
         for (const line of block) optionLines.push(line)
       }
-      if (hiddenAfter > 0) optionLines.push(this.palette.dim(`↓ ${hiddenAfter} more`))
+      if (hiddenAfter > 0) optionLines.push(this.palette.dim(this.t('question.moreBelow', { count: hiddenAfter })))
       for (const line of optionLines) body.push(line)
       for (const line of positionLines) body.push(line)
       for (const line of footerLines) body.push(line)
@@ -1033,7 +1185,7 @@ export class QuestionDialog implements Component, Focusable {
       const compactFooter = [
         ...this.error === ''
           ? []
-          : [truncateToWidth(this.palette.error(`Error: ${this.error}`), innerWidth, '…')],
+          : [truncateToWidth(this.palette.error(this.t('question.errorPrefix', { error: this.error })), innerWidth, '…')],
         this.compactOptionControls(
           innerWidth,
           headerBudget === 1 && contentLines.length > headerBudget,
@@ -1067,9 +1219,9 @@ export class QuestionDialog implements Component, Focusable {
     }
     if (visibleRows.length > maxHeight) {
       visibleRows = maxHeight === 1
-        ? [this.palette.dim(`↑ ${visibleRows.length} lines hidden`)]
+        ? [this.palette.dim(this.t('question.linesHidden', { count: visibleRows.length }))]
         : [
-          this.palette.dim(`↑ ${visibleRows.length - maxHeight + 1} lines hidden`),
+          this.palette.dim(this.t('question.linesHidden', { count: visibleRows.length - maxHeight + 1 })),
           ...visibleRows.slice(-(maxHeight - 1)),
         ]
     }
@@ -1140,8 +1292,8 @@ export class QuestionDialog implements Component, Focusable {
 
   /** Keep Page Up / Page Down discoverable when a full pager status cannot fit. */
   private pagerStatus(first: number, last: number, total: number, innerWidth: number): string {
-    const full = `… lines ${first}-${last}/${total} • PgUp/PgDn`
-    const compact = `PgUp/PgDn ${first}/${total}`
+    const full = this.t('question.pagerFull', { first, last, total })
+    const compact = this.t('question.pagerCompact', { first, total })
     return this.palette.dim(truncateToWidth(
       visibleWidth(full) <= innerWidth ? full : compact,
       innerWidth,
@@ -1152,9 +1304,11 @@ export class QuestionDialog implements Component, Focusable {
   /** Render custom-mode controls on one row when the header must compact. */
   private compactCustomControls(innerWidth: number): string {
     const controls = this.options.length > 0
-      ? 'Enter submit • Esc options'
-      : 'Enter submit • Esc cancel'
-    const fallback = this.options.length > 0 ? '↵ Esc options' : 'Enter Esc cancel'
+      ? this.t('question.compactCustomOptions')
+      : this.t('question.compactCustomCancel')
+    const fallback = this.options.length > 0
+      ? this.t('question.compactCustomFallbackOptions')
+      : this.t('question.compactCustomFallbackCancel')
     const line = visibleWidth(controls) <= innerWidth ? controls : fallback
     return this.palette.dim(truncateToWidth(line, innerWidth, '…'))
   }
@@ -1163,10 +1317,10 @@ export class QuestionDialog implements Component, Focusable {
   private compactOptionControls(innerWidth: number, showPager = false): string {
     const controls = [
       ...(this.options.length > 1 ? ['↑/↓'] : []),
-      'Tab custom',
-      ...(this.question.multiSelect ? ['Space toggle'] : []),
-      'Enter',
-      'Esc interrupt',
+      this.t('question.compactTab'),
+      ...(this.question.multiSelect ? [this.t('question.compactSpace')] : []),
+      this.t('question.compactEnter'),
+      this.t('question.compactInterrupt'),
       ...(showPager ? ['PgUp/PgDn'] : []),
     ].join(' • ')
     const optionNavigation = this.options.length > 1 ? '↑↓ ' : ''

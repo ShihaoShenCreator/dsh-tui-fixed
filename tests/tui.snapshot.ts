@@ -6,7 +6,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { compactCheckpointSource, CompactionId } from '@deepseek-ai/dsh-compaction'
-import { createUserMessage, CallId, type ContentBlock , createMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, CallId, type ContentBlock , createMessage, createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-llm-retry'
 import { SessionId, type JsonValue, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionReferenceResolver from '@deepseek-ai/dsh-session-reference'
@@ -61,6 +61,7 @@ const CHECKPOINTS = [
   'model-selector',
   'model-selector-filtered',
   'model-switching',
+  'effort-selector',
   'errors-and-help',
   'disposed-terminal',
   'resume-sessions-loading',
@@ -969,6 +970,34 @@ describe('TUI terminal-state snapshots', () => {
       harness.terminal.send('\r')
     })
     await checkpoint('model-switching', harness.terminal, { includeScrollback: true })
+    await disposeSnapshot(harness)
+  })
+
+  it('pins the reasoning-effort selector and its applied notice', async () => {
+    const harness = await setupSnapshot({
+      agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-pro' },
+      catalog: {
+        providers: [{ id: 'deepseek-official', name: 'DeepSeek' }],
+        models: [{ provider: 'deepseek-official', id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' }],
+        resolveModelInfo: () => Promise.resolve({
+          context: { contextWindow: 128_000 },
+          reasoning: {
+            efforts: [
+              { id: ReasoningEffortId('off'), name: 'Off' },
+              { id: ReasoningEffortId('low'), name: 'Low' },
+              { id: ReasoningEffortId('high'), name: 'High' },
+              { id: ReasoningEffortId('max'), name: 'Max' },
+            ],
+            defaultEffort: ReasoningEffortId('high'),
+          },
+        }),
+      },
+    }, { columns: 92, rows: 32 })
+    await renderAfter(harness, () => {
+      harness.terminal.send('/effort')
+      harness.terminal.send('\r')
+    })
+    await checkpoint('effort-selector', harness.terminal, { includeScrollback: true })
     await disposeSnapshot(harness)
   })
 

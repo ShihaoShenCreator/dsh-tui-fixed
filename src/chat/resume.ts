@@ -61,13 +61,14 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
     ctx, agent, runtime, resolved, palette, overlayManager,
     sessionQuery, ui, editor,
   } = deps
+  const t = deps.translator.t
   let resumeOverlay: TuiOverlaySession | undefined
   let resumeInFlight = false
   let resumeScan = 0
 
   /** Label any session's own workspace the way the prompt labels the current one. */
   const workspaceLabel = (cwd: string | undefined): string =>
-    runtime.formatCwd?.(cwd) ?? formatCwd(cwd)
+    runtime.formatCwd?.(cwd) ?? formatCwd(cwd, t)
 
   /** Summarize one record from metadata and its batch-folded title. */
   const summarize = (
@@ -81,6 +82,7 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
     agent.session.id,
     agent.session.header.cwd,
     workspaceLabel,
+    t,
   )
 
   /** The disabled fallback row for a session whose title read failed. */
@@ -90,11 +92,11 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
     error: unknown,
   ): ResumeCandidate => ({
     record,
-    title: 'Unreadable session',
+    title: t('resume.unreadable'),
     lastActivityAt: lastActivityAt ?? record.header.createdAt,
     currentWorkspace: record.header.cwd === agent.session.header.cwd,
     workspaceLabel: workspaceLabel(record.header.cwd),
-    disabledReason: `session cannot be loaded: ${errorChain(error)}`,
+    disabledReason: t('resume.cannotLoad', { error: errorChain(error) }),
   })
 
   /**
@@ -208,29 +210,29 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
   const preflightResume = async (sessionId: SessionId): Promise<{ id: SessionId; cwd: string }> => {
     const query = sessionQuery()
     /* v8 ignore start -- showResume alone calls this after proving the optional service exists */
-    if (query === undefined) throw new Error('Resume is unavailable: session query is not mounted.')
+    if (query === undefined) throw new Error(t('resume.error.queryUnmounted'))
     /* v8 ignore stop */
     const initialStatus = deps.agentStatus()
-    if (initialStatus !== 'idle') throw new Error(`Resume requires an idle agent (status: ${initialStatus}).`)
+    if (initialStatus !== 'idle') throw new Error(t('resume.error.requiresIdle', { status: initialStatus }))
     const record = (await query.listSessions()).find(candidate => candidate.header.id === sessionId)
-    if (record === undefined) throw new Error(`Session "${sessionId}" is no longer available.`)
+    if (record === undefined) throw new Error(t('resume.error.gone', { id: sessionId }))
     const candidate = summarize(record, undefined, undefined)
     if (candidate.disabledReason !== undefined) throw new Error(candidate.disabledReason)
     let events: readonly SessionEvent[]
     try {
       events = (await query.readSession(record.header.id)).events
     } catch (error: unknown) {
-      throw new Error(`session cannot be loaded: ${errorChain(error)}`)
+      throw new Error(t('resume.cannotLoad', { error: errorChain(error) }))
     }
     const route = resumeRoute(events)
     if (route !== undefined && !ctx.llm.listProviders().some(provider => provider.id === route.provider)) {
-      throw new Error(`session is complete, but route is currently unavailable (${route.provider}/${route.model})`)
+      throw new Error(t('resume.error.routeUnavailable', { provider: route.provider, model: route.model }))
     }
     const cwd = record.header.cwd
     /* v8 ignore next -- summarizeResumeCandidate disables a cwd-less record, so the check above already rejected it */
-    if (cwd === undefined) throw new Error(`Session "${sessionId}" has no recorded workspace to resume in.`)
+    if (cwd === undefined) throw new Error(t('resume.error.noWorkspace', { id: sessionId }))
     const finalStatus = deps.agentStatus()
-    if (finalStatus !== 'idle') throw new Error(`Resume requires an idle agent (status: ${finalStatus}).`)
+    if (finalStatus !== 'idle') throw new Error(t('resume.error.requiresIdle', { status: finalStatus }))
     return { id: record.header.id, cwd }
   }
 
@@ -244,7 +246,7 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
       if (hostHandoff === undefined) {
         await overlay.close()
         resumeOverlay = undefined
-        deps.appendNotice('Session is resumable, but this host cannot hand it off in place.', 'warning')
+        deps.appendNotice(t('resume.notice.noHost'), 'warning')
         return
       }
       /* v8 ignore next -- shutdown during preflight invalidates an awaited service read or reaches this guard */
@@ -264,17 +266,17 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
       // restored session header, is what the filesystem and shell tools resolve
       // against.
       await hostHandoff(checked.id, checked.cwd)
-      throw new Error('resume host returned without replacing the process')
+      throw new Error(t('resume.error.hostReturned'))
     } catch (error: unknown) {
       if (!deps.isDisposed()) {
         if (terminalReleased) {
           ui.start()
           ui.setFocus(editor)
-          deps.appendNotice(`Resume handoff failed: ${errorChain(error)}`, 'error')
+          deps.appendNotice(t('resume.notice.handoffFailed', { error: errorChain(error) }), 'error')
         } else {
           await overlay.close()
           resumeOverlay = undefined
-          deps.appendNotice(`Resume failed: ${errorChain(error)}`, 'error')
+          deps.appendNotice(t('resume.notice.failed', { error: errorChain(error) }), 'error')
         }
       }
     } finally {
@@ -285,12 +287,12 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
   return {
     showResume(): void {
       if (agent.status !== 'idle') {
-        deps.appendNotice('Resume requires the current turn to finish or be cancelled first.', 'warning')
+        deps.appendNotice(t('resume.notice.requiresIdle'), 'warning')
         return
       }
       const listQuery = sessionQuery()
       if (listQuery === undefined) {
-        deps.appendNotice('Resume is not available: session query is not mounted.', 'warning')
+        deps.appendNotice(t('resume.notice.queryUnmounted'), 'warning')
         return
       }
       const scan = ++resumeScan
@@ -311,6 +313,7 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
             palette,
             (candidate) => { void handoffResume(candidate, session) },
             () => { void session.close() },
+            t,
           )
           return picker
         },
@@ -366,7 +369,7 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
       void scanCandidates().catch((error: unknown) => {
         if (scanStale()) return
         void session.close()
-        deps.appendNotice(`Resume session scan failed: ${errorChain(error)}`, 'error')
+        deps.appendNotice(t('resume.notice.scanFailed', { error: errorChain(error) }), 'error')
       })
     },
   }

@@ -97,6 +97,18 @@ import {
   type Config,
 } from './config.ts'
 import {
+  createTranslator,
+  localeSettingOf,
+  resolveLocale,
+  retargetTranslator,
+  type LocaleId,
+  type TranslationKey,
+  type TParams,
+} from './i18n/translate.ts'
+// Type import also declaration-merges the Loader's loader/volatile-update event
+// onto the Cordis Events map that ctx.on is typed against.
+import type {} from '@deepseek-ai/cordis-plugin-loader'
+import {
   ContextCardComponent,
   type ToolCardVisibility,
   HeaderComponent,
@@ -107,6 +119,7 @@ import {
   UserMessageComponent,
 } from './components/transcript.ts'
 import {
+  TOOL_CARD_PHASE_KEYS,
   compactTargetLabel,
   DetailsDialog,
   diagnosticMeter,
@@ -142,6 +155,7 @@ import {
 } from './chat/model-command.ts'
 import { createQuestionQueue } from './chat/questions.ts'
 import { createResumeController } from './chat/resume.ts'
+import { createSettingsController } from './chat/settings-command.ts'
 import type { TuiRuntime } from './runtime.ts'
 import { WorkspaceFileSearch } from './chat/file-autocomplete.ts'
 
@@ -252,13 +266,6 @@ export const inject = ['agents', 'sessions', 'commands', 'userQuestions', 'tools
 /** Model guidance for path-only file references selected through the TUI. */
 export const FILE_REFERENCE_PROMPT = 'Paths prefixed with @ are files explicitly referenced by the user. Use the read tool when their contents are needed; do not claim to have inspected a file before reading it.'
 
-/**
- * Transcript row standing in for one compacted range. The conversation the
- * compaction replaced stays rendered above it: the marker reports where the
- * model stopped seeing that history, not that the history is gone.
- */
-const COMPACTION_MARKER = '… earlier context was compacted …'
-
 interface RunningStatus {
   turn: number | undefined
   timer: ReturnType<typeof setInterval>
@@ -315,6 +322,16 @@ export function createTuiChat(
   const agent = ctx.agents.get(sessionId)
   if (agent === undefined) throw new Error(`ui-tui: session "${sessionId}" is not running`)
   const resolved = resolveTuiConfig(config)
+  // One translator per channel: `/settings` retargets it in place, and every
+  // component holds this same reference, so a language switch repaints every
+  // surface through a single rebuild rather than re-plumbing each controller.
+  const localeRef = config.locale
+  let localeSetting = localeSettingOf(localeRef) ?? 'auto'
+  const translator = createTranslator(resolved.locale)
+  const t = (key: TranslationKey, params?: TParams): string => translator.t(key, params)
+  // An explicitly configured placeholder is deployment copy and wins in every
+  // language; absent one, the prompt hint follows the interface language.
+  const configuredPlaceholder = config.theme?.inputPlaceholder
   const palette = createPalette(resolved.theme.color)
   const mdTheme = markdownTheme(palette)
   const ui = new TUI(runtime.terminal, resolved.showHardwareCursor)
@@ -336,7 +353,7 @@ export function createTuiChat(
     },
   })
   editor.hintPrefix = initialInputPrompt
-  const todo = new TodoComponent(palette)
+  const todo = new TodoComponent(palette, t)
   const compactionStatusLine = new Text('', 0, 0)
   let showReasoning = resolved.showReasoning
   // Ctrl+O cycles collapsed -> expanded -> hidden. Codex-style: hidden drops
@@ -409,7 +426,9 @@ export function createTuiChat(
     palette,
     resolved.theme.color && resolved.theme.truecolor,
   )
-  const formattedCwd = displayText(runtime.formatCwd?.(agent.session.header.cwd) ?? formatCwd(agent.session.header.cwd))
+  const formattedCwd = displayText(
+    runtime.formatCwd?.(agent.session.header.cwd) ?? formatCwd(agent.session.header.cwd, t),
+  )
   const branch = runtime.gitBranch?.(cwd) ?? gitBranch(cwd)
   const promptValues: TuiPromptValueHandle[] = [
     ctx.tuiPrompt.register('cwd', palette.bold(palette.accent(formattedCwd))),
@@ -433,18 +452,18 @@ export function createTuiChat(
     gitValue.set(branch === undefined ? undefined : palette.dim(` (${displayText(branch)})`))
     const rate = cacheHitRate(tokens)
     const usage = `↑${formatTokens(tokens.input)} ↓${formatTokens(tokens.output)}`
-    modelValue.set(`  ${palette.dim(displayText(target.current === undefined ? 'model unset' : compactTargetLabel(target.current)))}`)
+    modelValue.set(`  ${palette.dim(displayText(target.current === undefined ? t('prompt.modelUnset') : compactTargetLabel(target.current)))}`)
     tokenValue.set(`  ${palette.dim(rate === undefined ? usage : `${usage}  cache ${rate}%`)}`)
     const contextWindow = modelController.contextWindow()
-    contextValue.set(contextWindow === undefined ? undefined : `  ${palette.dim(
-      `${Math.min(100, Math.round(ctx.tokenMeter.measure(agent.session).totalTokens / contextWindow * 100))}% context`,
-    )}`)
-    const queued = runningStatus === undefined ? undefined : formatQueuedStatus(pendingSteering.size)
+    contextValue.set(contextWindow === undefined ? undefined : `  ${palette.dim(t('prompt.contextPercent', {
+      percent: Math.min(100, Math.round(ctx.tokenMeter.measure(agent.session).totalTokens / contextWindow * 100)),
+    }))}`)
+    const queued = runningStatus === undefined ? undefined : formatQueuedStatus(pendingSteering.size, t)
     queuedValue.set(queued === undefined ? undefined : palette.dim(queued))
     symbolValue.set(palette.bold(palette.accent('dsh')))
     compactionStatusLine.setText(compacting === undefined
       ? ''
-      : palette.dim(`Context being compacted ${formatStatusDuration(renderTime - compacting.startedAt)}`))
+      : palette.dim(t('prompt.compacting', { duration: formatStatusDuration(renderTime - compacting.startedAt) })))
     // `${indicator}` owns the caret column and its trailing gap before the
     // cursor. The active status glyph replaces the `>` caret in place — same
     // width every frame — fading in when work starts, throbbing while it runs,
@@ -575,7 +594,7 @@ export function createTuiChat(
       ctx.logger.warn(`ui-tui: overlay failed: ${message}`)
       /* v8 ignore next -- shutdown removes overlays before the terminal stops */
       if (disposed) return
-      appendNotice(`TUI overlay failed: ${message}`, 'error')
+      appendNotice(t('notice.overlayFailed', { error: message }), 'error')
     },
   })
 
@@ -586,6 +605,7 @@ export function createTuiChat(
     resolved,
     palette,
     overlayManager,
+    translator,
     target,
     appendNotice,
     requestRender,
@@ -645,7 +665,9 @@ export function createTuiChat(
     else if (fadeOutGlyph !== undefined) beginFadeOut(fadeOutGlyph)
     else clearTurnStatus()
     editor.borderColor = status === 'running' ? text => palette.accent(text) : text => palette.dim(text)
-    editor.hint = status === 'running' ? palette.dim(displayInlineText(resolved.theme.inputPlaceholder)) : undefined
+    editor.hint = status === 'running'
+      ? palette.dim(displayInlineText(configuredPlaceholder ?? t('prompt.inputPlaceholder')))
+      : undefined
     if (status === 'running') {
       const turn = priorTurn ?? openTurn(agent.session.snapshotEvents())
       const running: RunningStatus = {
@@ -678,6 +700,7 @@ export function createTuiChat(
       resolved.maxDiffEditLength,
       palette,
       mdTheme,
+      t,
     )
     card.setVisibility(toolsVisibility)
     toolCards.set(event.data.callId, card)
@@ -768,6 +791,7 @@ export function createTuiChat(
       showReasoning,
       palette,
       mdTheme,
+      t,
       liveTiming.lookup,
     )
     registerAssistantStep(streaming)
@@ -792,7 +816,9 @@ export function createTuiChat(
           const references = sessionReferenceCard(event.data.source)
           if (references !== undefined) {
             chat.addChild(new Spacer(1))
-            chat.addChild(new Text(palette.dim(`Referenced sessions · ${references.map(displayText).join(', ')}`), 0, 0))
+            chat.addChild(new Text(palette.dim(t('transcript.referencedSessions', {
+              list: references.map(displayText).join(', '),
+            })), 0, 0))
             break
           }
           const text = contentText(event.data.content).trim()
@@ -806,7 +832,7 @@ export function createTuiChat(
             const label = typeof labelled.plugin === 'string' ? labelled.plugin
               : typeof labelled.kind === 'string' ? labelled.kind
                 : 'context'
-            const card = new ContextCardComponent(label, text, resolved.maxToolOutputLines, palette)
+            const card = new ContextCardComponent(label, text, resolved.maxToolOutputLines, palette, t)
             card.setExpanded(toolsVisibility === 'expanded')
             contextCards.add(card)
             chat.addChild(new Spacer(1))
@@ -817,7 +843,7 @@ export function createTuiChat(
         const text = displayText(contentText(event.data.content).trim())
         if (text) {
           chat.addChild(new Spacer(1))
-          chat.addChild(new UserMessageComponent(text, palette, mdTheme))
+          chat.addChild(new UserMessageComponent(text, palette, mdTheme, t('role.you')))
           if (options.addHistory) editor.addToHistory(text)
         }
         break
@@ -839,7 +865,12 @@ export function createTuiChat(
         retractFailedStreaming()
         const retryLimit = event.data.mode === 'always' ? '∞' : String(event.data.maxRetries)
         appendNotice(
-          `Retrying model request (${event.data.retry}/${retryLimit}) in ${event.data.delayMs}ms: ${event.data.failure.message}`,
+          t('notice.retrying', {
+            retry: event.data.retry,
+            limit: retryLimit,
+            delayMs: event.data.delayMs,
+            failure: event.data.failure.message,
+          }),
           'warning',
         )
         break
@@ -862,6 +893,7 @@ export function createTuiChat(
             resolved.maxDiffEditLength,
             palette,
             mdTheme,
+            t,
           )
           card.setVisibility(toolsVisibility)
           chat.addChild(card)
@@ -902,23 +934,23 @@ export function createTuiChat(
             break
           case 'aborted':
             appendNotice(
-              reason.reason.kind === 'disposed' ? 'Turn stopped: the agent was disposed.' : 'Turn cancelled.',
+              reason.reason.kind === 'disposed' ? t('notice.turnStoppedDisposed') : t('notice.turnCancelled'),
               'warning',
             )
             break
           case 'blocked':
-            appendNotice('Turn blocked before a model step started.', 'warning')
+            appendNotice(t('notice.turnBlocked'), 'warning')
             break
           case 'max-tokens':
-            appendNotice('The model reached its output-token limit.', 'warning')
+            appendNotice(t('notice.turnMaxTokens'), 'warning')
             break
           case 'interrupted':
-            appendNotice('The previous process ended during this turn.', 'warning')
+            appendNotice(t('notice.turnInterrupted'), 'warning')
             break
           default:
             // TurnEndReasonMap is merge-extensible: a plugin-added outcome
             // still names why the agent stopped rather than ending silently.
-            appendNotice(`Turn ended: ${(reason as { kind: string }).kind}.`, 'warning')
+            appendNotice(t('notice.turnEnded', { kind: (reason as { kind: string }).kind }), 'warning')
             break
         }
         break
@@ -934,7 +966,7 @@ export function createTuiChat(
 
   const renderCompactionMarker = (): void => {
     chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.dim(COMPACTION_MARKER), 0, 0))
+    chat.addChild(new Text(palette.dim(t('transcript.compactionMarker')), 0, 0))
   }
 
   /**
@@ -994,6 +1026,7 @@ export function createTuiChat(
     resolved,
     palette,
     overlayManager,
+    translator,
     requestRender,
     isDisposed,
     questionMaxHeight: () => {
@@ -1013,6 +1046,7 @@ export function createTuiChat(
     resolved,
     palette,
     overlayManager,
+    translator,
     // Optional and independently mounted. Cordis transiently leaves this sibling
     // non-ACTIVE during command callbacks, so the non-strict read is intentional;
     // terminal fiber states still exclude failed, closing, and closed providers.
@@ -1060,7 +1094,7 @@ export function createTuiChat(
   const requestExit = (): void => {
     if (agent.status === 'running') {
       agent.cancel({ kind: 'user' })
-      appendNotice('Cancelling the active turn before exit…', 'warning')
+      appendNotice(t('notice.cancellingBeforeExit'), 'warning')
       void agent.whenIdle().then(() => shutdown(true))
       return
     }
@@ -1101,7 +1135,9 @@ export function createTuiChat(
     // Hidden mode folds each turn's steps into one assistant message; other
     // modes restore the per-step Assistant headers.
     for (const turn of assistantSteps.keys()) applyTurnFolding(turn)
-    appendNotice(toolsVisibility === 'hidden' ? 'Tool cards hidden.' : `Tool and context cards ${toolsVisibility}.`)
+    appendNotice(toolsVisibility === 'hidden'
+      ? t('details.toolsHidden')
+      : t('details.toolsState', { state: t(TOOL_CARD_PHASE_KEYS[toolsVisibility]) }))
   }
 
   const toggleTools = (): void => {
@@ -1111,22 +1147,50 @@ export function createTuiChat(
       : toolsVisibility === 'expanded' ? 'hidden' : 'collapsed')
   }
 
-  const setReasoning = (show: boolean): void => {
-    showReasoning = show
-    const activeStreaming = streaming
+  /**
+   * Rebuild the transcript from the durable log while carrying the active
+   * streaming step across the rebuild, so a presentation change never truncates
+   * a turn that is still streaming.
+   * @param reapply - Applies the caller's own presentation setting to the surviving step.
+   */
+  const rebuildTranscriptKeepingStream = (reapply: (step: StreamingAssistantComponent) => void): void => {
+    const active = streaming
     rebuildTranscript(false)
     /* v8 ignore next -- the non-streaming command path is covered; this branch preserves an active stream across rebuild. */
-    if (activeStreaming !== undefined) {
-      streaming = activeStreaming
-      streaming.setShowReasoning(showReasoning)
-      registerAssistantStep(activeStreaming)
-      chat.addChild(activeStreaming)
-      chat.addChild(activeStreaming.timing)
-    }
-    appendNotice(`Reasoning blocks ${showReasoning ? 'shown' : 'hidden'}.`)
+    if (active === undefined) return
+    streaming = active
+    reapply(active)
+    registerAssistantStep(active)
+    chat.addChild(active)
+    chat.addChild(active.timing)
+  }
+
+  const setReasoning = (show: boolean): void => {
+    showReasoning = show
+    rebuildTranscriptKeepingStream(step => step.setShowReasoning(showReasoning))
+    appendNotice(t('details.reasoningState', { state: t(showReasoning ? 'common.shown' : 'common.hidden') }))
   }
 
   const toggleReasoning = (): void => { setReasoning(!showReasoning) }
+
+  // `/settings` reads the same live configuration the Web settings pages edit.
+  // The panel's session-local group reuses the Ctrl+O / Ctrl+R setters, so all
+  // three entry points mutate one closure state.
+  const settingsController = createSettingsController({
+    ctx,
+    resolved,
+    palette,
+    overlayManager,
+    translator,
+    appendNotice,
+    requestRender,
+    isDisposed,
+    localState: () => ({ showReasoning, toolCards: toolsVisibility }),
+    applyLocal: (patch) => {
+      if (patch.toolCards !== undefined && patch.toolCards !== toolsVisibility) setToolsVisibility(patch.toolCards)
+      if (patch.showReasoning !== undefined && patch.showReasoning !== showReasoning) setReasoning(patch.showReasoning)
+    },
+  })
 
   // The selector and the argument grammar mutate the same closure state the
   // Ctrl+O cycle and Ctrl+R toggle drive, so every entry converges.
@@ -1144,6 +1208,7 @@ export function createTuiChat(
           if (selection.visibility !== toolsVisibility) setToolsVisibility(selection.visibility)
         },
         () => { void session.close() },
+        t,
       ),
       options: { width: resolved.detailsDialogWidth, anchor: 'center', margin: 1 },
     })
@@ -1176,7 +1241,7 @@ export function createTuiChat(
           reasoning = !showReasoning
         }
       } else {
-        return { kind: 'error', text: `Unknown /details argument "${token}". Usage: /details [collapsed|expanded|hidden] [reasoning [on|off]]` }
+        return { kind: 'error', text: t('details.unknownArgument', { argument: token }) }
       }
     }
     // Reasoning first: its transcript rebuild would drop the visibility notice.
@@ -1191,14 +1256,14 @@ export function createTuiChat(
       return `/${command.name}${input} — ${command.description}`
     })
     chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.bold(palette.accent('Keyboard shortcuts')), 0, 0))
+    chat.addChild(new Text(palette.bold(palette.accent(t('help.title'))), 0, 0))
     chat.addChild(new Text([
-      'Enter send • Shift/Alt+Enter newline • Up/Down prompt history',
-      'Esc cancel turn • Ctrl+O cycle cards (collapse/expand/hide) • Ctrl+R toggle reasoning • Ctrl+L redraw',
-      'Ctrl+C cancel while running; clear input or exit while idle • Ctrl+D exit',
+      t('help.keys'),
+      t('help.transcript'),
+      t('help.exit'),
       '',
       ...commandLines,
-      '/skill:<name> [instructions] — load a skill into the conversation',
+      t('help.skill'),
     ].map(line => palette.dim(line)).join('\n'), 0, 0))
     requestRender()
   }
@@ -1206,7 +1271,7 @@ export function createTuiChat(
   const showPalette = (): void => {
     chat.addChild(new Spacer(1))
     chat.addChild(new Text(
-      renderPalette(palette, currentScheme, resolved.theme.color).join('\n'), 0, 0,
+      renderPalette(palette, currentScheme, resolved.theme.color, t).join('\n'), 0, 0,
     ))
     requestRender()
   }
@@ -1216,64 +1281,81 @@ export function createTuiChat(
     /* v8 ignore next -- disposal during the awaited assembly is covered by command-owner teardown tests. */
     if (disposed) return
     /* v8 ignore next -- SystemPrompt always emits at least its required base section. */
-    const systemPrompt = displayText(renderPrompt(assembly)) || '(empty)'
-    const registeredTools = assembly.tools.map(tool => displayText(tool.name)).join(', ') || '(none)'
+    const systemPrompt = displayText(renderPrompt(assembly)) || t('common.empty')
+    const registeredTools = assembly.tools.map(tool => displayText(tool.name)).join(', ') || t('common.none')
     const events = agent.session.snapshotEvents()
     const latestActivity = events.findLast(event => event.type !== 'session/end-seed')?.time
       ?? agent.session.header.createdAt
     const usedContext = Math.max(0, Math.round(ctx.tokenMeter.measure(agent.session).totalTokens))
-    let context = `${formatDiagnosticNumber(usedContext)} used · capacity unknown`
+    let context = t('status.contextUnknown', { used: formatDiagnosticNumber(usedContext) })
     const contextWindow = modelController.contextWindow()
     if (contextWindow !== undefined) {
       const contextPercent = Math.round(usedContext / contextWindow * 100)
-      context = `${diagnosticMeter(contextPercent, palette)} ${String(contextPercent)}% used (${formatDiagnosticNumber(usedContext)} / ${formatDiagnosticNumber(contextWindow)})`
+      context = `${diagnosticMeter(contextPercent, palette)} ${t('status.contextUsed', {
+        percent: contextPercent,
+        used: formatDiagnosticNumber(usedContext),
+        window: formatDiagnosticNumber(contextWindow),
+      })}`
     }
     const rate = cacheHitRate(tokens)
     const turns = events.filter(event => event.type === 'turn/start').length
     const steps = events.filter(event => event.type === 'step/start').length
     const toolCalls = events.filter(event => event.type === 'tool/call').length
-    const model = target.current === undefined ? 'unset' : displayText(targetLabel(target.current))
+    const model = target.current === undefined ? t('common.unset') : displayText(targetLabel(target.current))
     const effort = target.current === undefined
-      ? 'unset'
+      ? t('common.unset')
       : target.current.reasoningEffort === undefined
-        ? 'default'
+        ? t('status.effortDefault')
         : displayText(target.current.reasoningEffort)
     const groups: readonly (readonly StatusCardRow[])[] = [
       [
-        ['Session', displayText(agent.session.id)],
-        ['Title', displayText(sessionTitle ?? 'untitled')],
-        ['Directory', displayText(cwd)],
-        ['Model', `${model} ${palette.dim(`(effort ${effort}; reasoning blocks ${showReasoning ? 'shown' : 'hidden'})`)}`],
+        [t('status.label.session'), displayText(agent.session.id)],
+        [t('status.label.title'), displayText(sessionTitle ?? t('common.untitled'))],
+        [t('status.label.directory'), displayText(cwd)],
+        [t('status.label.model'), `${model} ${palette.dim(t('status.effortAndReasoning', {
+          effort,
+          state: t(showReasoning ? 'common.shown' : 'common.hidden'),
+        }))}`],
       ],
       [
-        ['Agent', [
+        [t('status.label.agent'), [
           agent.status,
-          formatDiagnosticCount(events.length, 'event'),
-          formatDiagnosticCount(turns, 'turn'),
-          formatDiagnosticCount(steps, 'step'),
-          formatDiagnosticCount(toolCalls, 'tool call'),
+          t('count.event', { count: events.length }),
+          t('count.turn', { count: turns }),
+          t('count.step', { count: steps }),
+          t('count.toolCall', { count: toolCalls }),
         ].join(' · ')],
       ],
       [
-        ['Tokens', `${formatDiagnosticNumber(tokens.input)} input + ${formatDiagnosticNumber(tokens.output)} output`],
-        ['KV cache', rate === undefined
-          ? `n/a (${formatDiagnosticNumber(tokens.cacheRead)} read + ${formatDiagnosticNumber(tokens.cacheWrite)} write)`
-          : `${diagnosticMeter(rate, palette)} ${String(rate)}% hit (${formatDiagnosticNumber(tokens.cacheRead)} read + ${formatDiagnosticNumber(tokens.cacheWrite)} write)`],
-        ['Context', context],
+        [t('status.label.tokens'), t('status.tokensLine', {
+          input: formatDiagnosticNumber(tokens.input),
+          output: formatDiagnosticNumber(tokens.output),
+        })],
+        [t('status.label.kvCache'), rate === undefined
+          ? t('status.kvCacheNone', {
+            read: formatDiagnosticNumber(tokens.cacheRead),
+            write: formatDiagnosticNumber(tokens.cacheWrite),
+          })
+          : `${diagnosticMeter(rate, palette)} ${t('status.kvCacheHit', {
+            rate,
+            read: formatDiagnosticNumber(tokens.cacheRead),
+            write: formatDiagnosticNumber(tokens.cacheWrite),
+          })}`],
+        [t('status.label.context'), context],
       ],
       [
-        ['Created', formatDiagnosticTime(agent.session.header.createdAt)],
-        ['Active', formatDiagnosticTime(latestActivity)],
+        [t('status.label.created'), formatDiagnosticTime(agent.session.header.createdAt)],
+        [t('status.label.active'), formatDiagnosticTime(latestActivity)],
       ],
     ]
-    const card = new StatusCardComponent(groups, palette)
+    const card = new StatusCardComponent(groups, palette, t('status.cardTitle'))
     chat.addChild(new Spacer(1))
     chat.addChild(card)
     chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.bold(palette.accent('System prompt')), 0, 0))
+    chat.addChild(new Text(palette.bold(palette.accent(t('status.systemPrompt'))), 0, 0))
     chat.addChild(new Text(systemPrompt, 0, 0))
     chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.bold(palette.accent('Registered tools')), 0, 0))
+    chat.addChild(new Text(palette.bold(palette.accent(t('status.registeredTools'))), 0, 0))
     chat.addChild(new Text(registeredTools, 0, 0))
     requestRender()
   }
@@ -1351,15 +1433,15 @@ export function createTuiChat(
   // The agent scope is minted by agent-loop and intentionally inherits only
   // that core plugin's dependencies. A child command producer declares its own
   // UI-service dependency while retaining the parent agent scope and lifetime.
-  const commandFiber = agent.ctx.inject(['commands'], (commandCtx) => {
+  const registerCommands = (): Fiber => agent.ctx.inject(['commands'], (commandCtx) => {
     commandCtx.commands.register({
       name: 'help',
-      description: 'Show keyboard shortcuts and commands',
+      description: t('cmd.help.description'),
       handler: () => { showHelp(); return { kind: 'success' } },
     })
     commandCtx.commands.register({
       name: 'model',
-      description: 'Show or switch this session\'s model',
+      description: t('cmd.model.description'),
       input: { hint: '[[provider/]model]' },
       handler: ({ rawInput }) => {
         modelController.queueModelCommand(rawInput)
@@ -1367,34 +1449,49 @@ export function createTuiChat(
       },
     })
     commandCtx.commands.register({
+      name: 'effort',
+      description: t('cmd.effort.description'),
+      input: { hint: '[level|default]' },
+      handler: ({ rawInput }) => {
+        modelController.queueEffortCommand(rawInput)
+        return { kind: 'success' }
+      },
+    })
+    commandCtx.commands.register({
       name: 'clear',
-      description: 'Clear the transcript view (session history is unchanged)',
+      description: t('cmd.clear.description'),
       handler: () => { chat.clear(); requestRender(); return { kind: 'success' } },
     })
     commandCtx.commands.register({
       name: 'details',
-      description: 'Select tool-card visibility and reasoning display',
+      description: t('cmd.details.description'),
       input: { hint: '[collapsed|expanded|hidden] [reasoning [on|off]]' },
       handler: ({ rawInput }) => runDetails(rawInput),
     })
     commandCtx.commands.register({
+      name: 'settings',
+      description: t('cmd.settings.description'),
+      input: { hint: '[namespace]' },
+      handler: ({ rawInput }) => { settingsController.open(rawInput); return { kind: 'success' } },
+    })
+    commandCtx.commands.register({
       name: 'palette',
-      description: 'Show every color and attribute role this terminal renders',
+      description: t('cmd.palette.description'),
       handler: () => { showPalette(); return { kind: 'success' } },
     })
     commandCtx.commands.register({
       name: 'reload',
-      description: 'EXPERIMENTAL (dev): re-read loader config files and apply the diff (idle only)',
+      description: t('cmd.reload.description'),
       handler: () => { runReload(); return { kind: 'success' } },
     })
     commandCtx.commands.register({
       name: 'resume',
-      description: 'List this workspace\'s resumable sessions',
+      description: t('cmd.resume.description'),
       handler: () => { resume.showResume(); return { kind: 'success' } },
     })
     commandCtx.commands.register({
       name: 'status',
-      description: 'Show session diagnostics, system prompt, and registered tools',
+      description: t('cmd.status.description'),
       handler: async ({ signal }) => { await showStatus(signal); return { kind: 'success' } },
     })
     const exitHandler = (): CommandResult => {
@@ -1403,15 +1500,57 @@ export function createTuiChat(
     }
     commandCtx.commands.register({
       name: 'exit',
-      description: 'Exit after the active turn reaches idle',
+      description: t('cmd.exit.description'),
       handler: exitHandler,
     })
     commandCtx.commands.register({
       name: 'quit',
-      description: 'Exit after the active turn reaches idle',
+      description: t('cmd.quit.description'),
       handler: exitHandler,
     })
   })
+  let commandFiber = registerCommands()
+
+  /**
+   * Apply one interface language to every live surface: the transcript, the
+   * prompt line, the registered command descriptions, and the terminal title.
+   * The Loader has already committed the new value into the running config
+   * reference before this runs, so the whole repaint is one retarget plus a
+   * rebuild — nothing is re-wired.
+   * @param locale - Locale to render from now on.
+   */
+  const applyLocale = (locale: LocaleId): void => {
+    if (locale === translator.locale) return
+    retargetTranslator(translator, locale)
+    // Command descriptions are copy too, so the registration is rebuilt with
+    // the new locale; a dispose racing shutdown leaves the next render empty
+    // rather than throwing.
+    void commandFiber.dispose().then(() => {
+      /* v8 ignore next -- teardown disposes the channel before a queued re-registration lands. */
+      if (disposed) return
+      commandFiber = registerCommands()
+      refreshCommandAutocomplete()
+      refreshVisibleSlashAutocomplete()
+    })
+    // Every rendered string is derived at render time, so a rebuild is the
+    // whole repaint; the streaming step carries across it like any other
+    // presentation change.
+    rebuildTranscriptKeepingStream(() => {})
+    setStatus(agent.status)
+    updateTerminalTitle()
+    requestRender()
+  }
+
+  // The Live setting field hands a running plugin the volatile reference, so a
+  // write from `/settings` reaches this fiber as a committed value plus a
+  // change notification. `ctx` here is the TUI entry's own fiber context, which
+  // is exactly the scope the Loader dispatches to.
+  const disposeLocaleWatch = ctx.on('loader/volatile-update', (paths) => {
+    if (!paths.some(path => path.length === 1 && path[0] === 'locale')) return
+    localeSetting = localeSettingOf(localeRef) ?? 'auto'
+    applyLocale(resolveLocale(localeSetting))
+  })
+
   const fileReferencePromptFiber = agent.ctx.inject(['systemPrompt'], (promptCtx) => {
     promptCtx.systemPrompt.section({
       name: 'ui:tui-file-reference',
@@ -1430,14 +1569,14 @@ export function createTuiChat(
       (execution) => {
         if (disposed) return
         if (execution === undefined) {
-          appendNotice(`Unknown command: ${text}`, 'warning')
+          appendNotice(t('notice.unknownCommand', { text }), 'warning')
         } else if (execution.result.text !== undefined && execution.result.text !== '') {
           appendNotice(execution.result.text, execution.result.kind === 'error' ? 'error' : 'info')
         }
       },
       (error: unknown) => {
         if (!disposed) {
-          appendNotice(`Command failed: ${errorChain(error)}`, 'error')
+          appendNotice(t('notice.commandFailed', { error: errorChain(error) }), 'error')
         }
       },
     ).finally(() => { commandControllers.delete(controller) })
@@ -1445,7 +1584,7 @@ export function createTuiChat(
 
   const dispatchMessage = (content: ContentBlock[], attachedContext?: UserMessage): void => {
     if (disposed) {
-      appendNotice(`Agent "${agent.id}" is disposed.`, 'error')
+      appendNotice(t('notice.agentDisposed', { id: agent.id }), 'error')
       return
     }
     if (agent.status === 'running') {
@@ -1474,35 +1613,35 @@ export function createTuiChat(
   /** Load a manually invoked skill and deliver its rendered body as a user turn, reporting lookup outcomes as notices. */
   const invokeSkill = (name: string, instructions: string): void => {
     if (skills === undefined) {
-      appendNotice('Skills are not available in this session.', 'warning')
+      appendNotice(t('skill.unavailable'), 'warning')
       return
     }
     const lookup = { cwd, signal: skillAbort.signal }
     const reportFailure = (error: unknown): void => {
       if (disposed) return
-      appendNotice(`Skill "${name}" failed to load: ${errorChain(error)}`, 'error')
+      appendNotice(t('skill.loadFailed', { name, error: errorChain(error) }), 'error')
     }
     skills.list(lookup).then(
       (summaries) => {
         if (disposed) return
         const summary = summaries.find(skill => skill.name === name)
         if (summary === undefined) {
-          appendNotice(`Unknown skill: ${name}`, 'warning')
+          appendNotice(t('skill.unknown', { name }), 'warning')
           return
         }
         if (!summary.invocation.userInvocable) {
-          appendNotice(`Skill "${name}" is not available for user invocation.`, 'warning')
+          appendNotice(t('skill.notInvocable', { name }), 'warning')
           return
         }
         skills.get(name, lookup).then(
           (skill) => {
             if (disposed) return
             if (skill === undefined) {
-              appendNotice(`Unknown skill: ${name}`, 'warning')
+              appendNotice(t('skill.unknown', { name }), 'warning')
               return
             }
             if (!skill.invocation.userInvocable) {
-              appendNotice(`Skill "${name}" is not available for user invocation.`, 'warning')
+              appendNotice(t('skill.notInvocable', { name }), 'warning')
               return
             }
             deliver(renderSkillInvocation(skill, instructions))
@@ -1526,14 +1665,14 @@ export function createTuiChat(
     // under in-flight calls. Idleness is advisory (a send can race in after
     // the check), but it removes the common footgun.
     if (agent.status !== 'idle') {
-      appendNotice(`/reload requires an idle agent (status: ${agent.status}).`, 'warning')
+      appendNotice(t('reload.requiresIdle', { status: agent.status }), 'warning')
       return
     }
     // Re-entrancy guard: concurrent refreshes over a genuinely changed file
     // would race unmutexed tree updates (create/remove interleaving); one
     // reload at a time keeps the update pass single-writer.
     if (reloadInFlight) {
-      appendNotice('A config reload is already running.', 'warning')
+      appendNotice(t('reload.alreadyRunning'), 'warning')
       return
     }
 
@@ -1543,7 +1682,7 @@ export function createTuiChat(
     // proxy read would throw `cannot get property without inject` in a fiber.
     const loader = ctx.get('loader') as { entries(): Iterable<{ subtree?: { refresh?(): Promise<void> } }> } | undefined
     if (loader === undefined) {
-      appendNotice('/reload needs the cordis Loader; this runtime has none.', 'warning')
+      appendNotice(t('reload.requiresLoader'), 'warning')
       return
     }
     const refreshes: Promise<void>[] = []
@@ -1551,13 +1690,13 @@ export function createTuiChat(
       if (entry.subtree?.refresh !== undefined) refreshes.push(entry.subtree.refresh())
     }
     reloadInFlight = true
-    appendNotice(`Reloading ${refreshes.length} config tree(s)… (experimental)`)
+    appendNotice(t('reload.reloading', { count: refreshes.length }))
     // refresh() never rejects (it warns and keeps the running tree), so the
     // join can only fulfill; the catch arm guards a future contract change.
     void Promise.all(refreshes).then(() => {
-      appendNotice('Config reload complete. Unchanged files were skipped; invalid files keep the running tree (see logs).')
+      appendNotice(t('reload.complete'))
     }).catch((error: unknown) => {
-      appendNotice(`Config reload failed: ${errorChain(error)}`, 'error')
+      appendNotice(t('reload.failed', { error: errorChain(error) }), 'error')
     }).finally(() => {
       reloadInFlight = false
     })
@@ -1575,7 +1714,7 @@ export function createTuiChat(
       editor.addToHistory(text)
       editor.setText('')
       const { name: skillName, instructions } = parseSkillCommand(text)
-      if (skillName === '') appendNotice('Usage: /skill:<name> [instructions]', 'warning')
+      if (skillName === '') appendNotice(t('skill.usage'), 'warning')
       else invokeSkill(skillName, instructions)
       return
     }
@@ -1590,7 +1729,7 @@ export function createTuiChat(
       parsed = parseSessionReferenceText(text)
     } catch (error: unknown) {
       restoreSubmittedInput()
-      appendNotice(`Invalid session reference: ${errorChain(error)}`, 'error')
+      appendNotice(t('sessionRef.invalid', { error: errorChain(error) }), 'error')
       return
     }
     if (parsed.references.length === 0) {
@@ -1602,7 +1741,7 @@ export function createTuiChat(
     const sessionReferenceResolver = ctx.get('sessionReferenceResolver')
     if (sessionReferenceResolver === undefined) {
       restoreSubmittedInput()
-      appendNotice('Session reference capability unavailable.', 'error')
+      appendNotice(t('sessionRef.unavailable'), 'error')
       return
     }
     const controller = new AbortController()
@@ -1623,7 +1762,7 @@ export function createTuiChat(
     }, (error: unknown) => {
       if (!disposed && !controller.signal.aborted) {
         restoreSubmittedInput()
-        appendNotice(`Session reference failed: ${errorChain(error)}`, 'error')
+        appendNotice(t('sessionRef.failed', { error: errorChain(error) }), 'error')
       }
     }).finally(() => {
       referenceControllers.delete(controller)
@@ -1662,7 +1801,7 @@ export function createTuiChat(
       return { consume: true }
     }
     if (matchesKey(data, Key.ctrl('d'))) {
-      if (agent.status === 'running') appendNotice('Cancel the active turn before exiting.', 'warning')
+      if (agent.status === 'running') appendNotice(t('notice.exitBlocked'), 'warning')
       else requestExit()
       return { consume: true }
     }
@@ -1702,7 +1841,7 @@ export function createTuiChat(
       clearInterval(compacting.timer)
       compacting = undefined
       if (event.data.error !== undefined) {
-        appendNotice(`Compaction failed: ${event.data.error}`, 'warning')
+        appendNotice(t('notice.compactionFailed', { error: event.data.error }), 'warning')
       }
       // A concurrently running turn owns the indicator. Keep its timer and
       // progress bit instead of letting the compaction fade clear that state.
@@ -1776,7 +1915,7 @@ export function createTuiChat(
     // intentionally presentation-silent: this disposal notice owns the
     // terminal outcome, and no animation may survive agent detachment.
     clearStatus()
-    appendNotice(`Agent "${agent.id}" was disposed.`, 'warning')
+    appendNotice(t('notice.agentWasDisposed', { id: agent.id }), 'warning')
     disposed = true
   })
 
@@ -1797,7 +1936,9 @@ export function createTuiChat(
     disposeError()
     disposeAgent()
     disposeSchemeListener()
+    disposeLocaleWatch()
     disposeTargetListeners()
+    settingsController.detach()
     modelController.detach()
   }
 
@@ -1833,11 +1974,7 @@ export function createTuiChat(
   const restoredGoal = foldGoal(agent.session.snapshotEvents()).goal
   /* v8 ignore next -- goal replay coverage lives with the goal seam; the TUI only formats its startup notice. */
   if (restoredGoal !== undefined && restoredGoal.phase !== 'complete') {
-    appendNotice(
-      `Goal restored (${restoredGoal.phase}) with automatic continuation disarmed. `
-      + 'Human confirmation is required; send “继续” or run /goal resume.',
-      'warning',
-    )
+    appendNotice(t('notice.goalRestored', { phase: restoredGoal.phase }), 'warning')
   }
   setStatus(agent.status)
   try {

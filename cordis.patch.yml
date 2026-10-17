@@ -82,6 +82,11 @@
         sessionId: !!js ctx.tuiStartup.sessionId ?? ctx.tuiStartup.resumeSessionId
         showReasoning: true
         maxToolOutputLines: 6
+        # Interface language. `auto` follows LC_ALL/LC_MESSAGES/LANG, then the
+        # operating system's own language. A deployment may pin `en` or `zh`;
+        # the Language row of this entry in `/settings` writes the choice back
+        # here and applies it to the running terminal without a restart.
+        locale: auto
 
     - id: tool-ask-user
       name: '@deepseek-ai/dsh-tool-ask-user'

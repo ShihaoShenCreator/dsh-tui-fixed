@@ -8,7 +8,7 @@ import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import { internals, provideCmdline } from '@deepseek-ai/dsh-cmdline'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { apply, TUI_STARTUP_SERVICE, type TuiStartupValues } from '../src/startup.ts'
 import { TUI_GOODBYE_MESSAGE_KEY, TUI_RESUME_HOST_KEY } from '../src/host-keys.ts'
 
@@ -26,6 +26,19 @@ afterEach(async () => {
   for (const dispose of disposers.splice(0)) await dispose()
   internals.stdout = process.stdout
   internals.stderr = process.stderr
+})
+
+/**
+ * The provider localizes its `--help` text and usage errors from the process
+ * environment, so the suite pins an English locale instead of inheriting the
+ * machine's. `LC_ALL` outranks the other variables, which makes one assignment
+ * decisive even when the developer's shell sets `LANG`.
+ */
+const previousLcAll = process.env.LC_ALL
+beforeEach(() => { process.env.LC_ALL = 'en_US.UTF-8' })
+afterEach(() => {
+  if (previousLcAll === undefined) delete process.env.LC_ALL
+  else process.env.LC_ALL = previousLcAll
 })
 
 /**

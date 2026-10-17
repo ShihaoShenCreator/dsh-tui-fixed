@@ -8,17 +8,22 @@
  */
 
 import type { ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
-import { errorChain, LlmError, type ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { errorChain, LlmError, type LlmModelReasoningInfo, type ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { TuiOverlaySession } from '../extension/types.ts'
 import { displayText } from '../components/text.ts'
 import {
+  EffortDialog,
+  effortChoices,
+  effortLabel,
   ModelDialog,
   readModelChoices,
   targetLabel,
   targetReasoningLabel,
+  type EffortChoice,
   type ModelChoice,
   type ModelDialogSelection,
 } from '../components/dialogs.ts'
+import type { TranslationKey } from '../i18n/translate.ts'
 import type { ChannelNotice, ChatChannelDeps } from './channel.ts'
 
 /** Collaborators the model controller needs from the chat channel. */
@@ -33,9 +38,11 @@ export interface ModelController {
   contextWindow(): number | undefined
   /** Queue a `/model` command; empty argument opens the selector. */
   queueModelCommand(raw: string): void
+  /** Queue an `/effort` command; empty argument opens the effort selector. */
+  queueEffortCommand(raw: string): void
   /** Drop the pending context-window resolution (shutdown). */
   resetContextResolution(): void
-  /** Forget the tracked selector overlay (shutdown). */
+  /** Forget the tracked selector overlays (shutdown). */
   clearOverlay(): void
   /** Remove the adapter-registration listener (channel detach). */
   detach(): void
@@ -52,10 +59,14 @@ type ContextResolution =
  */
 export function createModelController(deps: ModelControllerDeps): ModelController {
   const { ctx, resolved, palette, overlayManager, target } = deps
+  const { t } = deps.translator
   let contextWindow: number | undefined
   let contextResolution: Promise<ContextResolution> | undefined
   let modelOverlay: TuiOverlaySession | undefined
-  let modelCommands = Promise.resolve()
+  let effortOverlay: TuiOverlaySession | undefined
+  // `/model` and `/effort` mutate the same target, so they share one queue and
+  // can never interleave a read of the catalog with another command's switch.
+  let pendingCommands = Promise.resolve()
 
   // A route whose adapter has not registered yet. Loader activation order is
   // service-driven, so the TUI can mount before a configured adapter plugin
@@ -80,7 +91,7 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
           awaitingAdapter = true
           return
         }
-        deps.appendNotice(`Could not resolve model context: ${errorChain(result.error)}`, 'error')
+        deps.appendNotice(t('model.contextFailed', { error: errorChain(result.error) }), 'error')
         return
       }
       contextWindow = result.contextWindow
@@ -107,8 +118,11 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
       ? (sameRoute ? target.current?.reasoningEffort ?? selected.reasoning?.defaultEffort : selected.reasoning?.defaultEffort)
       : explicitReasoning.effort
     if (sameRoute && target.current?.reasoningEffort === reasoningEffort) {
-      const reasoning = targetReasoningLabel(selected, reasoningEffort)
-      deps.appendNotice(`Model is already ${targetLabel(selected)}${reasoning === undefined ? '' : ` with reasoning effort ${displayText(reasoning)}`}.`)
+      const reasoning = targetReasoningLabel(selected, reasoningEffort, t)
+      deps.appendNotice(t('model.already', {
+        label: targetLabel(selected),
+        reasoning: reasoning === undefined ? '' : t('model.alreadyEffort', { effort: displayText(reasoning) }),
+      }))
       return
     }
     target.current = {
@@ -116,13 +130,80 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
       model: selected.model,
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
     }
-    resolveContextWindow(target.current)
-    const reasoning = targetReasoningLabel(selected, reasoningEffort)
+    // An effort-only change keeps the same route, so its context window is
+    // already resolved; re-resolving would briefly drop the prompt's meter.
+    if (!sameRoute) resolveContextWindow(target.current)
+    const reasoning = targetReasoningLabel(selected, reasoningEffort, t)
     deps.appendNotice([
-      `Model selected: ${targetLabel(selected)}.`,
-      ...reasoning === undefined ? [] : [`Reasoning effort: ${displayText(reasoning)}.`],
-      'New steps will use it.',
+      t('model.selected', { label: targetLabel(selected) }),
+      ...reasoning === undefined ? [] : [t('model.reasoningSet', { effort: displayText(reasoning) })],
+      t('model.newSteps'),
     ].join(' '))
+  }
+
+  /** Apply one reasoning effort to the current route, reporting an unchanged selection. */
+  const applyEffort = (choice: ModelChoice, effort: EffortChoice): void => {
+    if (target.current?.reasoningEffort === effort.id) {
+      deps.appendNotice(t('effort.already', {
+        effort: displayText(effortLabel(choice.reasoning, effort.id, t)),
+      }))
+      return
+    }
+    target.current = {
+      provider: choice.provider,
+      model: choice.model,
+      ...effort.id === undefined ? {} : { reasoningEffort: effort.id },
+    }
+    deps.appendNotice([
+      t('effort.set', { effort: displayText(effortLabel(choice.reasoning, effort.id, t)) }),
+      t('model.newSteps'),
+    ].join(' '))
+  }
+
+  /** Read the current route's adapter metadata as a model choice. */
+  const readCurrentChoice = async (current: ModelSelection): Promise<ModelChoice> => {
+    const info = await ctx.llm.resolveModelInfo(current.provider, current.model)
+    return {
+      provider: current.provider,
+      model: current.model,
+      modelName: info.name,
+      ...info.description === undefined ? {} : { description: info.description },
+      ...info.reasoning === undefined ? {} : { reasoning: info.reasoning },
+    }
+  }
+
+  const showEffortSelector = (choice: ModelChoice): void => {
+    const choices = effortChoices(choice.reasoning, t)
+    if (choices.length === 0) {
+      deps.appendNotice(t('effort.noEfforts', { label: targetLabel(choice) }), 'warning')
+      return
+    }
+    void effortOverlay?.close()
+    const session = overlayManager.open({
+      create: () => new EffortDialog(
+        choices,
+        target.current?.reasoningEffort,
+        resolved.maxModelOptions,
+        palette,
+        (selected: EffortChoice) => {
+          void session.close()
+          applyEffort(choice, selected)
+        },
+        () => { void session.close() },
+        t,
+      ),
+      options: {
+        width: resolved.modelDialogWidth,
+        maxHeight: resolved.modelDialogMaxHeight,
+        anchor: 'center',
+        margin: 1,
+      },
+    })
+    effortOverlay = session
+    void session.closed.then(() => {
+      if (effortOverlay === session) effortOverlay = undefined
+    })
+    deps.requestRender()
   }
 
   const showModelSelector = (choices: readonly ModelChoice[]): void => {
@@ -143,6 +224,7 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
           selectModel(selection.choice, { effort: selection.reasoningEffort })
         },
         () => { void session.close() },
+        t,
       ),
       options: {
         width: resolved.modelDialogWidth,
@@ -168,7 +250,7 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
     }
     const parts = argument.split(/\s+/u)
     if (parts.length > 2) {
-      deps.appendNotice('Usage: /model [provider/]model', 'warning')
+      deps.appendNotice(t('model.usage'), 'warning')
       return
     }
 
@@ -181,7 +263,7 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
       matches = qualified.length > 0 ? qualified : choices.filter(choice => choice.model === value)
     }
     if (matches.length === 0) {
-      deps.appendNotice(`Unknown model: ${argument}. Run /model to list available models.`, 'warning')
+      deps.appendNotice(t('model.unknown', { argument }), 'warning')
       return
     }
     if (matches.length > 1) {
@@ -194,20 +276,75 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
     selectModel(selected)
   }
 
+  const handleEffortCommand = async (raw: string): Promise<void> => {
+    const current = target.current
+    if (current === undefined) {
+      deps.appendNotice(t('effort.unsetModel'), 'warning')
+      return
+    }
+    const choice = await readCurrentChoice(current)
+    if (deps.isDisposed()) return
+    const argument = raw.trim()
+    if (argument === '') {
+      showEffortSelector(choice)
+      return
+    }
+    if (/\s/u.test(argument)) {
+      deps.appendNotice(t('effort.usage'), 'warning')
+      return
+    }
+    // `default` names the no-explicit-effort row and stays accepted even when
+    // the adapter advertises no efforts: a resumed selection may still carry
+    // an effort this route no longer offers, and clearing it must be possible.
+    if (argument.toLocaleLowerCase() === t('common.default').toLocaleLowerCase()) {
+      if (current.reasoningEffort === undefined) {
+        deps.appendNotice(t('effort.already', { effort: t('common.default') }))
+        return
+      }
+      target.current = { provider: current.provider, model: current.model }
+      deps.appendNotice([t('effort.set', { effort: t('common.default') }), t('model.newSteps')].join(' '))
+      return
+    }
+    if (choice.reasoning === undefined) {
+      deps.appendNotice(t('effort.noEfforts', { label: targetLabel(choice) }), 'warning')
+      return
+    }
+    const choices = effortChoices(choice.reasoning, t)
+    const query = argument.toLocaleLowerCase()
+    const matches = choices.filter(candidate =>
+      candidate.name.toLocaleLowerCase() === query
+      || (candidate.id !== undefined && String(candidate.id).toLocaleLowerCase() === query))
+    if (matches.length === 0) {
+      const available = choices.map(candidate => candidate.name).join(', ')
+      deps.appendNotice(t('effort.unknown', { argument, available }), 'warning')
+      return
+    }
+    const selected = matches[0]
+    /* v8 ignore next -- a non-empty matches array always has index zero. */
+    if (selected === undefined) return
+    applyEffort(choice, selected)
+  }
+
+  const queue = (run: () => Promise<void>, failure: TranslationKey): void => {
+    pendingCommands = pendingCommands.then(run).catch((error: unknown) => {
+      if (!deps.isDisposed()) deps.appendNotice(`${t(failure)}: ${errorChain(error)}`, 'error')
+    })
+  }
+
   return {
     contextWindow: () => contextWindow,
     queueModelCommand(raw: string): void {
-      modelCommands = modelCommands.then(async () => {
-        await handleModelCommand(raw)
-      }).catch((error: unknown) => {
-        if (!deps.isDisposed()) deps.appendNotice(`Could not read the model catalog: ${errorChain(error)}`, 'error')
-      })
+      queue(() => handleModelCommand(raw), 'model.catalogFailed')
+    },
+    queueEffortCommand(raw: string): void {
+      queue(() => handleEffortCommand(raw), 'effort.capabilitiesFailed')
     },
     resetContextResolution(): void {
       contextResolution = undefined
     },
     clearOverlay(): void {
       modelOverlay = undefined
+      effortOverlay = undefined
     },
     detach(): void {
       disposeAdapterListener()
