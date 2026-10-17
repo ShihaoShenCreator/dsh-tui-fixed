@@ -1,4 +1,4 @@
-# Turtle UI's dsh profile bundle patch (declared by the `dsh.bundle.patch`
+# Turtle UI Fixed's dsh profile bundle patch (declared by the `dsh.bundle.patch`
 # manifest field): applied over the dsh-base layer when this package appears
 # in a profile's `dsh.profile.bundles` list. Overrides base rows by id and inserts the
 # TUI front door plus its projection/storage support rows.
