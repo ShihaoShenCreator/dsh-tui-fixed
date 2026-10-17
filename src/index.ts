@@ -2,7 +2,7 @@
  * Interactive pi-tui front door for DeepSeek Harness agents. It renders the
  * durable session transcript, drives one configured agent, and provides
  * keyboard-driven user-questions dialogs without owning agent lifecycle.
- * @module @deepseek-ai/dsh-tui
+ * @module @shihaoshen/dsh-tui-fixed
  */
 
 import {
@@ -81,6 +81,7 @@ import {
   fadeGlyph,
   formatQueuedStatus,
   formatStatusDuration,
+  LiveTimingBuffer,
   openStepPhase,
   openTurn,
   pulseLevel,
@@ -99,9 +100,10 @@ import {
   ContextCardComponent,
   type ToolCardVisibility,
   HeaderComponent,
+  planItems,
   StreamingAssistantComponent,
-  ToolCardComponent,
   TodoComponent,
+  ToolCardComponent,
   UserMessageComponent,
 } from './components/transcript.ts'
 import {
@@ -361,6 +363,10 @@ export function createTuiChat(
   // One shared accumulator serves every step's timing footer; per-footer
   // replay of the whole log is quadratic on a long resumed session.
   const stepTimingTracker = new StepTimingTracker()
+  // In-flight chunks arrive only through `agent/assistant-stream`; the durable
+  // log gains them at settlement. Keeping them here lets the live timing footer
+  // and phase glyph respond before that, and settlement clears the overlay.
+  const liveTiming = new LiveTimingBuffer()
   // Assistant step components in model order per turn, for hidden-mode folding:
   // with tool cards hidden, a turn keeps one Assistant header and later steps
   // render as headerless continuations (see applyTurnFolding).
@@ -412,7 +418,7 @@ export function createTuiChat(
 
   // A configured subtitle renders as a banner line; when absent, the banner has
   // no subtitle. The banner itself sweeps in on start (see startBannerReveal).
-  let sessionTitle = foldSessionTitle(agent.session.events)?.title
+  let sessionTitle = foldSessionTitle(agent.session.snapshotEvents())?.title
   const header = new HeaderComponent(
     agent,
     () => sessionTitle ?? config.welcome,
@@ -461,9 +467,10 @@ export function createTuiChat(
     // and fading out after it ends before the plain `>` returns. Only the gray
     // brightness changes, so the cursor never shifts.
     const statusGlyph = runningPhaseGlyph(
-      agent.session.events,
+      agent.session.snapshotEvents(),
       runningStatus !== undefined,
       compacting !== undefined,
+      liveTiming.lookup,
     )
     // Remember the live phase glyph so the fade-out shows it, not the ttft
     // fallback the derivation returns once the closing turn's step has ended.
@@ -656,13 +663,13 @@ export function createTuiChat(
     editor.borderColor = status === 'running' ? text => palette.accent(text) : text => palette.dim(text)
     editor.hint = status === 'running' ? palette.dim(displayInlineText(resolved.theme.inputPlaceholder)) : undefined
     if (status === 'running') {
-      const turn = priorTurn ?? openTurn(agent.session.events)
+      const turn = priorTurn ?? openTurn(agent.session.snapshotEvents())
       const running: RunningStatus = {
         turn,
         startedAt: now(),
         // Seed with the current phase (ttft before the first step opens) so the
         // fade-out always has a glyph, even for a turn that ends before a render.
-        lastGlyph: TIMING_BUCKET_GLYPHS[openStepPhase(agent.session.events) ?? 'ttft'],
+        lastGlyph: TIMING_BUCKET_GLYPHS[openStepPhase(agent.session.snapshotEvents(), liveTiming.lookup) ?? 'ttft'],
         // Refresh every tick so the fading prompt phase glyph animates even
         // before the first token, when no streaming component exists yet.
         timer: setInterval(renderStatus, STATUS_ANIMATION_INTERVAL_MS),
@@ -771,12 +778,13 @@ export function createTuiChat(
   const startAssistantStep = (position: StepPosition): void => {
     streaming = new StreamingAssistantComponent(
       position,
-      () => agent.session.events,
+      () => agent.session.snapshotEvents(),
       stepTimingTracker,
       now,
       showReasoning,
       palette,
       mdTheme,
+      liveTiming.lookup,
     )
     registerAssistantStep(streaming)
     chat.addChild(streaming)
@@ -833,14 +841,6 @@ export function createTuiChat(
       case 'step/start':
         startAssistantStep(event.data)
         break
-      case 'assistant/chunk':
-        if (options.renderChunks && streaming !== undefined) {
-          streaming.update(event.data.chunk)
-          // The first streamed text/reasoning may make this step the turn's
-          // hidden-mode header owner (or a continuation with a visible body).
-          applyTurnFolding(streaming.position.turn)
-        }
-        break
       case 'assistant/message':
         completedStreaming = undefined
         // A settled component stays attached but never absorbs a later message
@@ -888,11 +888,9 @@ export function createTuiChat(
         trailStreamingTiming()
         break
       }
-      case 'todo/write':
-        todo.update(event.data.todos)
-        break
       case 'turn/start':
-        // Plan strip is turn-scoped: keep it after turn/end for reading, clear on the next turn.
+        // Clear per-turn state; the plan strip is turn-scoped: keep it after
+        // turn/end for reading, clear it when the next turn begins.
         todo.update([])
         break
       case 'session/title':
@@ -942,6 +940,10 @@ export function createTuiChat(
         break
       }
       default:
+        // `todo/write` is still a known session event type, but 0.2 declares no
+        // typed payload for it in the core event map (the todo producer is an
+        // optional plugin), so the plan strip reads it structurally here.
+        renderUnionedEvent(event)
         break
     }
   }
@@ -949,6 +951,18 @@ export function createTuiChat(
   const renderCompactionMarker = (): void => {
     chat.addChild(new Spacer(1))
     chat.addChild(new Text(palette.dim(COMPACTION_MARKER), 0, 0))
+  }
+
+  /**
+   * Render session events whose types are known to the runtime but not
+   * declared in the core typed event map. `todo/write` outlived its exported
+   * payload type in 0.2, and its producer is an optional plugin, so read the
+   * payload structurally instead of narrowing on the union.
+   * @param event - The untyped event.
+   */
+  const renderUnionedEvent = (event: SessionEvent): void => {
+    const raw = event as unknown as { type: string; data?: { todos?: unknown } }
+    if (raw.type === 'todo/write') todo.update(planItems(raw.data?.todos) ?? [])
   }
 
   /**
@@ -970,9 +984,14 @@ export function createTuiChat(
     contextCards.clear()
     assistantSteps.clear()
     streaming = undefined
+    // A rebuild replays the durable log only; buffered live chunks belong to the
+    // components it just discarded.
+    liveTiming.clear()
+    // The plan strip is derived from the last `todo/write`, which the replay
+    // below re-applies; start from none so a stale strip cannot survive `clear`.
     todo.update([])
     const transcriptCalls = transcriptToolCallIds(agent.session)
-    for (const event of agent.session.events) {
+    for (const event of agent.session.snapshotEvents()) {
       if (isReplacementSurfaceEvent(event)) {
         if (isCompactCheckpoint(event)) renderCompactionMarker()
         continue
@@ -1212,7 +1231,7 @@ export function createTuiChat(
     /* v8 ignore next -- SystemPrompt always emits at least its required base section. */
     const systemPrompt = displayText(renderPrompt(assembly)) || '(empty)'
     const registeredTools = assembly.tools.map(tool => displayText(tool.name)).join(', ') || '(none)'
-    const events = agent.session.events
+    const events = agent.session.snapshotEvents()
     const latestActivity = events.findLast(event => event.type !== 'session/end-seed')?.time
       ?? agent.session.header.createdAt
     const usedContext = Math.max(0, Math.round(ctx.tokenMeter.measure(agent.session).totalTokens))
@@ -1420,7 +1439,7 @@ export function createTuiChat(
   const runCommand = (text: string): void => {
     const controller = new AbortController()
     commandControllers.add(controller)
-    void ctx.commands.execute(agent, text, controller.signal).then(
+    void ctx.commands.execute(agent, text, [], controller.signal).then(
       (execution) => {
         if (disposed) return
         if (execution === undefined) {
@@ -1667,6 +1686,16 @@ export function createTuiChat(
     if (session !== agent.session) return
     if (event.type === 'tool/result') fileSearch.invalidate()
     recordEventUsage(tokens, event)
+    // Settlement moves the step's chunks into the durable log, and any durable
+    // transition (a tool call included) is newer than the live overlay's last
+    // chunk; either way the overlay must stop contributing so the timing and
+    // phase cannot be dragged back to a superseded bucket.
+    if (event.type === 'assistant/message' || event.type === 'assistant/attempt') {
+      liveTiming.settle({ turn: event.data.turn, step: event.data.step })
+    }
+    if (event.type === 'tool/call' || event.type === 'step/end') {
+      liveTiming.settle({ turn: event.data.turn, step: event.data.step })
+    }
     if (event.type === 'turn/start' && runningStatus !== undefined) runningStatus.turn = event.data.turn
     // Track live standalone compaction state.
     if (event.type === 'compaction/start' && event.data.turn === null) {
@@ -1682,7 +1711,7 @@ export function createTuiChat(
       return
     }
     if (event.type === 'compaction/end' && event.data.turn === null && compacting !== undefined) {
-      const fadeOutGlyph = runningPhaseGlyph(agent.session.events, false, true)
+      const fadeOutGlyph = runningPhaseGlyph(agent.session.snapshotEvents(), false, true)
       clearInterval(compacting.timer)
       compacting = undefined
       if (event.data.error !== undefined) {
@@ -1702,6 +1731,28 @@ export function createTuiChat(
       return
     }
     renderEvent(event, { addHistory: false, renderChunks: true })
+    requestRender()
+  })
+  const disposeAssistantStream = ctx.on('agent/assistant-stream', ({ agent: subject, frame }) => {
+    if (subject !== agent) return
+    if (frame.type === 'start') {
+      // A new attempt restarts the step's live phase; any buffered chunks from a
+      // superseded attempt must not bleed into it.
+      liveTiming.settle({ turn: frame.turn, step: frame.step })
+      return
+    }
+    if (frame.type !== 'chunk') return
+    const position = streaming === undefined
+      ? undefined
+      : { turn: streaming.position.turn, step: streaming.position.step }
+    if (position !== undefined) {
+      // Live chunks never enter the durable log; buffer them under the step so
+      // timing and the phase glyph follow the stream before settlement.
+      liveTiming.note(position, { time: frame.time, chunk: frame.chunk })
+    }
+    if (streaming === undefined) return
+    streaming.update(frame.chunk)
+    applyTurnFolding(streaming.position.turn)
     requestRender()
   })
   const settlePendingSteering = (id: MessageId): void => {
@@ -1752,6 +1803,7 @@ export function createTuiChat(
     for (const value of promptValues) value.dispose()
     stopBannerReveal()
     disposeSessionEvents()
+    disposeAssistantStream()
     disposeClaimed()
     disposeDiscarded()
     disposeStatus()
@@ -1791,7 +1843,7 @@ export function createTuiChat(
   }
 
   rebuildTranscript(true)
-  const restoredGoal = foldGoal(agent.session.events).goal
+  const restoredGoal = foldGoal(agent.session.snapshotEvents()).goal
   /* v8 ignore next -- goal replay coverage lives with the goal seam; the TUI only formats its startup notice. */
   if (restoredGoal !== undefined && restoredGoal.phase !== 'complete') {
     appendNotice(

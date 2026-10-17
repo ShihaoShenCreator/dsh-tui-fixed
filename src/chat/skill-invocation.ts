@@ -1,10 +1,10 @@
 /**
  * Manual `/skill:<name> [instructions]` parsing and model-visible rendering for
  * the terminal front door.
- * @module @deepseek-ai/dsh-tui/chat/skill-invocation
+ * @module @shihaoshen/dsh-tui-fixed/chat/skill-invocation
  */
 
-import { assertNever } from '@deepseek-ai/dsh-llm'
+import { assertNever } from '@deepseek-ai/dsh-util-values'
 import type { SkillDefinition, SkillResourceBase } from '@deepseek-ai/dsh-skill'
 
 /** Prefix that marks an editor submission as a manual skill invocation. */

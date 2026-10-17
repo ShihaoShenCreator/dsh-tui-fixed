@@ -8,3 +8,9 @@ allowBuilds:
 
 patchedDependencies:
   '@earendil-works/pi-tui@0.80.7': patches/@earendil-works__pi-tui@0.80.7.patch
+
+minimumReleaseAgeExclude:
+  - '@deepseek-ai/cordis-plugin-include@1.0.10'
+  - '@deepseek-ai/cordis-plugin-loader@1.0.6'
+  - '@deepseek-ai/cosmokit@1.8.6'
+  - '@deepseek-ai/schemastery@3.18.5'

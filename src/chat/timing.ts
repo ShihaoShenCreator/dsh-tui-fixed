@@ -3,9 +3,11 @@
  * front door. Timing buckets are replayed from the session event stream; the
  * active glyph fades in when work starts, throbs while work runs, and fades out
  * when it ends.
- * @module @deepseek-ai/dsh-tui/chat/timing
+ * @module @shihaoshen/dsh-tui-fixed/chat/timing
  */
 
+import { expandAssistantStream } from '@deepseek-ai/dsh-llm'
+import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Palette } from '../components/theme.ts'
 
@@ -105,19 +107,56 @@ function enterTimingBucket(state: TimingState, bucket: TimingBucket | undefined,
   if (bucket !== undefined) state.active = { bucket, since: at }
 }
 
+/**
+ * Replay the live chunks a step published before settlement. The TUI drops
+ * these the moment a durable event for the step lands, so this overlay only
+ * ever describes the in-flight attempt.
+ * @param state - Step timing state mutated in place.
+ * @param live - Live chunks for the step, in publication order.
+ */
+function advanceLiveChunks(
+  state: TimingState,
+  live: readonly LiveTimedChunk[] | undefined,
+): void {
+  for (const entry of live ?? []) advanceStreamChunk(state, entry.time, entry.chunk)
+}
+
+/**
+ * Advance one step's timing from a single durable stream chunk, replacing the
+ * old live `assistant/chunk` event. The first token leaves the pre-first-token
+ * wait; reasoning content accrues to the thinking bucket, text/reasoning block
+ * starts too, and tool-call deltas gate the step into the tools bucket.
+ * @param state - Step timing state mutated in place.
+ * @param chunk - Durable timed chunk from the step's expanded stream.
+ */
+function advanceStreamChunk(state: TimingState, time: number, chunk: StreamChunk): void {
+  if (state.active?.bucket === 'ttft') enterTimingBucket(state, undefined, time)
+  if (chunk.type === 'reasoning-delta' || (chunk.type === 'block-start' && chunk.blockType === 'reasoning')) {
+    enterTimingBucket(state, 'thinking', time)
+  } else if (chunk.type === 'text-delta' || (chunk.type === 'block-start' && chunk.blockType === 'text')) {
+    enterTimingBucket(state, 'responding', time)
+  } else if (chunk.type === 'tool-call-delta') {
+    enterTimingBucket(state, 'tools', time)
+  }
+}
+
+/**
+ * Fold one assistant step's durable stream into its timing state.
+ * @param state - Step timing state mutated in place.
+ * @param time0 - Timestamp of the step's `step/start`.
+ * @param stream - Compact assistant stream from an `assistant/message` event.
+ */
+function advanceAssistantStream(state: TimingState, time0: number, stream: readonly { time: number; chunk: StreamChunk }[]): void {
+  for (const { time, chunk } of stream) advanceStreamChunk(state, time, chunk)
+  // The stream carries no terminal close; the step's later `step/end` closes it.
+  void time0
+}
+
 function advanceStepTiming(
   state: TimingState,
-  event: Extract<SessionEvent, { type: 'assistant/chunk' | 'tool/call' | 'step/end' }>,
+  event: Extract<SessionEvent, { type: 'tool/call' | 'step/end' }>,
 ): void {
-  if (event.type === 'assistant/chunk') {
-    const chunk = event.data.chunk
-    if (state.active?.bucket === 'ttft') enterTimingBucket(state, undefined, event.time)
-    if (chunk.type === 'reasoning-delta' || (chunk.type === 'block-start' && chunk.blockType === 'reasoning')) {
-      enterTimingBucket(state, 'thinking', event.time)
-    } else if (chunk.type === 'text-delta' || (chunk.type === 'block-start' && chunk.blockType === 'text')) {
-      enterTimingBucket(state, 'responding', event.time)
-    }
-  } else if (event.type === 'tool/call') {
+  if (event.type === 'tool/call') {
     enterTimingBucket(state, 'tools', event.time)
   } else {
     closeTimingBucket(state, event.time)
@@ -139,6 +178,53 @@ function stepKey(position: StepPosition): string {
 interface TrackedStep extends TimingState {
   /** Set at the step's `step/end`; later same-coordinate events no longer advance the step. */
   closed: boolean
+}
+
+/** One process-local chunk publication that has not settled into the durable log yet. */
+export interface LiveTimedChunk {
+  time: number
+  chunk: StreamChunk
+}
+
+/**
+ * Live chunks seen through `agent/assistant-stream`, keyed by step. 0.2 keeps
+ * in-flight tokens out of the durable log, so replay-only timing would show
+ * model wait until settlement; this overlay supplies the live phase and its
+ * accrued wall time, and is dropped the moment the durable stream lands.
+ */
+export type LiveTimingLookup = (position: StepPosition) => readonly LiveTimedChunk[] | undefined
+
+/** Mutable per-step buffer of live chunks published since the last settlement. */
+export class LiveTimingBuffer {
+  private readonly chunks = new Map<string, LiveTimedChunk[]>()
+
+  /**
+   * Record one live chunk against its step.
+   * @param position - The publishing step.
+   * @param entry - The chunk and its publication time.
+   */
+  note(position: StepPosition, entry: LiveTimedChunk): void {
+    const key = stepKey(position)
+    const existing = this.chunks.get(key)
+    if (existing === undefined) this.chunks.set(key, [entry])
+    else existing.push(entry)
+  }
+
+  /**
+   * Drop a step's live chunks; its durable stream (or its end) now owns the step.
+   * @param position - The step whose stream settled.
+   */
+  settle(position: StepPosition): void {
+    this.chunks.delete(stepKey(position))
+  }
+
+  /** Drop every live chunk, e.g. on transcript rebuild or teardown. */
+  clear(): void {
+    this.chunks.clear()
+  }
+
+  /** Look up one step's live chunks. */
+  readonly lookup: LiveTimingLookup = position => this.chunks.get(stepKey(position))
 }
 
 /**
@@ -165,15 +251,26 @@ export class StepTimingTracker {
    * @param events - Current session event log (append-only).
    * @param position - Turn/step coordinates of the queried step.
    * @param at - Render clock to accumulate the open bucket up to.
+   * @param live - Live chunks published for this step but not yet durable.
    * @returns The step's per-phase totals; empty when the step never started.
    */
-  totalsAt(events: readonly SessionEvent[], position: StepPosition, at: number): TimingTotals {
+  totalsAt(
+    events: readonly SessionEvent[],
+    position: StepPosition,
+    at: number,
+    live?: LiveTimingLookup,
+  ): TimingTotals {
     for (; this.scanned < events.length; this.scanned += 1) {
       const event = events[this.scanned] as SessionEvent
       if (event.type === 'step/start') {
         const key = stepKey(event.data)
         if (!this.steps.has(key)) this.steps.set(key, { ...timingState(event.time), closed: false })
-      } else if (event.type === 'assistant/chunk' || event.type === 'tool/call' || event.type === 'step/end') {
+      } else if (event.type === 'assistant/message') {
+        const state = this.steps.get(stepKey(event.data))
+        if (state !== undefined && !state.closed) {
+          advanceAssistantStream(state, event.time, expandAssistantStream(event.data.stream))
+        }
+      } else if (event.type === 'tool/call' || event.type === 'step/end') {
         const state = this.steps.get(stepKey(event.data))
         if (state !== undefined && !state.closed) {
           advanceStepTiming(state, event)
@@ -182,7 +279,11 @@ export class StepTimingTracker {
       }
     }
     const state = this.steps.get(stepKey(position))
-    return state === undefined ? emptyTimingTotals() : timingTotalsAt(state, at)
+    if (state === undefined) return emptyTimingTotals()
+    // Live chunks accrue on top of the replayed log only while the step is open;
+    // the durable settlement drops them, so a chunk is never counted twice.
+    if (!state.closed && live !== undefined) advanceLiveChunks(state, live(position))
+    return timingTotalsAt(state, at)
   }
 }
 
@@ -219,9 +320,13 @@ const COMPACTING_GLYPH = '⊙'
  * step is open. The open step is the last `step/start` with no later matching
  * `step/end`; its bucket is replayed with the same rules as {@link StepTimingTracker}.
  * @param events - Session events to scan.
+ * @param live - Live chunks published for the open step but not yet durable.
  * @returns The open step's active bucket, or `undefined`.
  */
-export function openStepPhase(events: readonly SessionEvent[]): TimingBucket | undefined {
+export function openStepPhase(
+  events: readonly SessionEvent[],
+  live?: LiveTimingLookup,
+): TimingBucket | undefined {
   let startIndex = -1
   let start: Extract<SessionEvent, { type: 'step/start' }> | undefined
   for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -239,11 +344,16 @@ export function openStepPhase(events: readonly SessionEvent[]): TimingBucket | u
   const state = timingState(start.time)
   for (let index = startIndex + 1; index < events.length; index += 1) {
     const event = events[index] as SessionEvent
-    if ((event.type === 'assistant/chunk' || event.type === 'tool/call' || event.type === 'step/end')
+    if (event.type === 'assistant/message' && sameStep(event, position)) {
+      advanceAssistantStream(state, event.time, expandAssistantStream(event.data.stream))
+    } else if ((event.type === 'tool/call' || event.type === 'step/end')
       && sameStep(event, position)) {
       advanceStepTiming(state, event)
     }
   }
+  // In-flight tokens live only in the process-local stream, so the phase would
+  // otherwise stay on model wait until the message settles.
+  advanceLiveChunks(state, live?.(position))
   return state.active?.bucket
 }
 
@@ -255,15 +365,17 @@ export function openStepPhase(events: readonly SessionEvent[]): TimingBucket | u
  * @param events - Session events to derive the phase from.
  * @param running - Whether the agent is currently running.
  * @param compacting - Whether a live standalone compaction bracket is open.
+ * @param live - Live chunks published for the open step but not yet durable.
  * @returns The active status glyph, or `undefined` when idle.
  */
 export function runningPhaseGlyph(
   events: readonly SessionEvent[],
   running: boolean,
   compacting: boolean,
+  live?: LiveTimingLookup,
 ): string | undefined {
   if (running) {
-    const bucket = openStepPhase(events) ?? 'ttft'
+    const bucket = openStepPhase(events, live) ?? 'ttft'
     return TIMING_BUCKET_GLYPHS[bucket]
   }
   return compacting ? COMPACTING_GLYPH : undefined

@@ -3,7 +3,7 @@
  * Git-branch formatting, transcript/tool-call derivations over the session log,
  * session-reference context cards, the placeholder editor, and banner-reveal
  * timing constants. None of these close over channel state.
- * @module @deepseek-ai/dsh-tui/chat/helpers
+ * @module @shihaoshen/dsh-tui-fixed/chat/helpers
  */
 
 import { execFileSync } from 'node:child_process'
@@ -91,7 +91,7 @@ export function gitBranch(cwd: string): string | undefined {
  */
 export function transcriptToolCallIds(session: Session): Set<string> {
   const ids = new Set<string>()
-  for (const event of session.events) {
+  for (const event of session.snapshotEvents()) {
     if (event.type !== 'assistant/message' || !isAppendSurfaceEvent(event)) continue
     for (const block of event.data.message.content) {
       if (block.type === 'tool-call') ids.add(block.id)

@@ -3,7 +3,7 @@
  * user-questions provider, presents one question overlay at a time in FIFO
  * order, and settles each request on answer, abort, overlay error, or channel
  * shutdown.
- * @module @deepseek-ai/dsh-tui/chat/questions
+ * @module @shihaoshen/dsh-tui-fixed/chat/questions
  */
 
 import { errorChain } from '@deepseek-ai/dsh-llm'
@@ -127,33 +127,32 @@ export function createQuestionQueue(deps: QuestionQueueDeps): QuestionQueue {
     show()
   }
 
-  const unregister = ctx.userQuestions.registerProvider({
-    ask(request) {
-      return new Promise<AskUserQuestionAnswer>((resolveAnswer, reject) => {
-        const pending: PendingQuestion = {
-          request,
-          index: 0,
-          answers: [],
-          resolve: resolveAnswer,
-          reject,
-          overlay: undefined,
-          onAbort: () => {
-            if (activeQuestion === pending) {
-              activeQuestion = undefined
-              rejectQuestion(pending)
-              startNextQuestion()
-              return
-            }
-            // A non-active pending ask remains in the queue until this listener settles it.
-            questionQueue.splice(questionQueue.indexOf(pending), 1)
+  const unregister = ctx.on('user-questions/request', (request, next) => {
+    if (deps.isDisposed()) return next()
+    return new Promise<AskUserQuestionAnswer>((resolveAnswer, reject) => {
+      const pending: PendingQuestion = {
+        request: request as AskUserQuestionRequest,
+        index: 0,
+        answers: [],
+        resolve: resolveAnswer,
+        reject,
+        overlay: undefined,
+        onAbort: () => {
+          if (activeQuestion === pending) {
+            activeQuestion = undefined
             rejectQuestion(pending)
-          },
-        }
-        request.signal?.addEventListener('abort', pending.onAbort, { once: true })
-        questionQueue.push(pending)
-        startNextQuestion()
-      })
-    },
+            startNextQuestion()
+            return
+          }
+          // A non-active pending ask remains in the queue until this listener settles it.
+          questionQueue.splice(questionQueue.indexOf(pending), 1)
+          rejectQuestion(pending)
+        },
+      }
+      request.signal?.addEventListener('abort', pending.onAbort, { once: true })
+      questionQueue.push(pending)
+      startNextQuestion()
+    })
   })
 
   return {

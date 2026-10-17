@@ -1,0 +1,20 @@
+{
+  "// purpose": "Self-contained base compiler options for dsh-tui-fixed, replacing the sibling deepseek-harness tsconfig.base.json that no longer exists after migrating to published @deepseek-ai/dsh-* packages. Types resolve from node_modules, not a harness source checkout.",
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2024"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "isolatedModules": true
+  }
+}

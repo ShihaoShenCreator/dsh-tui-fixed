@@ -2,10 +2,9 @@
  * Session-resume sub-controller for the interactive chat channel: the
  * `/resume` selector, one metadata-plus-title scan that tolerates a corrupt
  * neighbor, the pre-handoff preflight, and the terminal handoff itself.
- * @module @deepseek-ai/dsh-tui/chat/resume
+ * @module @shihaoshen/dsh-tui-fixed/chat/resume
  */
 
-import { stat } from 'node:fs/promises'
 import type { TUI } from '@earendil-works/pi-tui'
 import type { Agent, AgentStatus } from '@deepseek-ai/dsh-agent'
 import { errorChain } from '@deepseek-ai/dsh-llm'
@@ -106,14 +105,16 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
    */
   const lastActivityAt = async (record: SessionRecord): Promise<number | undefined> => {
     const live = ctx.sessions.get(record.header.id)
-    if (live !== undefined) return live.events.at(-1)?.time
-    const location = ctx.get('sessionPersistence')?.locate(record.header)
-    if (location === undefined) return undefined
+    if (live !== undefined) return live.snapshotEvents().at(-1)?.time
+    const snapshot = await ctx.get('sessionPersistence')?.stat(record.header.id)
+    if (snapshot?.header.createdAt === undefined) return undefined
     try {
-      return (await stat(location.path)).mtimeMs
+      const events = (await sessionQuery()?.readSession(record.header.id))?.events
+      return events?.at(-1)?.time ?? snapshot.header.createdAt
     } catch {
-      // Only a just-deleted or never-materialized artifact fails stat; the row falls back to created-at.
-      return undefined
+      // Only a just-deleted or never-materialized log fails read; the row
+      // falls back to the persisted header's creation time.
+      return snapshot.header.createdAt
     }
   }
 
@@ -129,10 +130,12 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
     signal: AbortSignal,
   ): Promise<string | null | undefined> => {
     const live = ctx.sessions.get(record.header.id)
-    if (live !== undefined) return ctx.get('sessionProjections')?.snapshot(live).values.title
+    if (live !== undefined) return ctx.get('sessionProjections')?.snapshot(live)?.values.title
     const cached = cache.cachedSnapshot(record.header)
     if (cached !== undefined && 'title' in cached.values) return cached.values.title
-    return (await cache.coldSnapshot(record.header.id, signal)).values.title
+    const loaded = await sessionQuery()?.readSession(record.header.id)
+    if (loaded === undefined) return undefined
+    return cache.coldSnapshot(loaded.session, loaded.inheritedEventCount, loaded.events).values.title
   }
 
   /** One per-record title resolution: a title (absent for untitled) or an isolated failure. */
