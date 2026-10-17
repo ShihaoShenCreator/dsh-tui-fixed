@@ -142,7 +142,7 @@ import {
 } from './chat/model-command.ts'
 import { createQuestionQueue } from './chat/questions.ts'
 import { createResumeController } from './chat/resume.ts'
-import type { TuiResumeHost, TuiRuntime } from './runtime.ts'
+import type { TuiRuntime } from './runtime.ts'
 import { WorkspaceFileSearch } from './chat/file-autocomplete.ts'
 
 export { TuiPromptService } from './prompt.ts'
@@ -186,14 +186,8 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     /** Terminal-only interaction service, available only while a TUI is mounted. */
     tui: TuiExtensionService
-    /** Optional process host that can replace this TUI with a resumed session. */
-    tuiResumeHost: TuiResumeHost
     /** Launcher-owned `main` session identity; absent lets the app mint one. */
     mainSessionId: MainSessionIdentity | undefined
-    /** Line the launcher wants printed on exit; absent prints nothing. */
-    tuiGoodbyeMessage: string | undefined
-    /** Skill the launcher wants auto-invoked as the fresh session's first turn; absent leaves it to the user. */
-    tuiInitialSkill: string | undefined
   }
 }
 
@@ -219,24 +213,14 @@ export interface MainSessionIdentity {
  */
 export const MAIN_SESSION_ID_KEY = 'mainSessionId'
 
-/**
- * Context key a launcher sets before any Loader entry mounts
- * (`ctx.provide(TUI_GOODBYE_MESSAGE_KEY, line)`) to supply the line the TUI
- * prints once the terminal is released on exit — for the shipped CLI, the
- * command that resumes this session. The launcher owns the wording because only
- * it knows how it was invoked; the TUI escapes terminal controls before
- * rendering. Absent prints nothing.
- */
-export const TUI_GOODBYE_MESSAGE_KEY = 'tuiGoodbyeMessage'
-
-/**
- * Context key a launcher sets before any Loader entry mounts
- * (`ctx.provide(INITIAL_SKILL_KEY, name)`) to seed a fresh session's first user
- * turn with `/skill:<name>` — the `dsh migrate`/`dsh upgrade`
- * guided-session entry. The launcher sets it only when minting a fresh session,
- * so it never re-fires on a resumed one. Absent leaves the first turn to the user.
- */
-export const INITIAL_SKILL_KEY = 'tuiInitialSkill'
+// The launcher-side host keys are declared once in ./host-keys so this reader
+// and the startup provider that supplies them cannot drift; re-exported here
+// for consumers that import them from the package entry.
+export {
+  INITIAL_SKILL_KEY,
+  TUI_GOODBYE_MESSAGE_KEY,
+  TUI_RESUME_HOST_KEY,
+} from './host-keys.ts'
 
 /**
  * Optional terminal-local interaction service provided by one mounted TUI.
@@ -984,9 +968,12 @@ export function createTuiChat(
     contextCards.clear()
     assistantSteps.clear()
     streaming = undefined
-    // A rebuild replays the durable log only; buffered live chunks belong to the
-    // components it just discarded.
-    liveTiming.clear()
+    // The transcript replays the durable log only, but buffered live chunks are
+    // keyed by step, not by the components a rebuild discards: while the step is
+    // still open they are the only record of the phases already elapsed, so keep
+    // them or a mid-step rebuild (color-scheme change, Ctrl+R) would reset the
+    // timing footer back to the pre-first-token wait. Settlement or the step's
+    // end drops them.
     // The plan strip is derived from the last `todo/write`, which the replay
     // below re-applies; start from none so a stale strip cannot survive `clear`.
     todo.update([])

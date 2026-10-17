@@ -155,7 +155,7 @@ export class HeaderComponent implements Component {
     const usable = Math.max(1, width - 2)
     const name = this.gradient
       ? this.palette.bold(gradientText('DEEPSEEK'))
-      : this.palette.bold(this.palette.accent('DEEPSEEK'))
+      : this.palette.bold(this.palette.brand('DEEPSEEK'))
     const title = `${name} ${this.palette.bold('HARNESS')}`
     const detail = displayText(this.agent.session.id)
     const subtitle = this.subtitle()

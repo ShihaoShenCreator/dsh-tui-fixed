@@ -122,6 +122,29 @@ function advanceLiveChunks(
 }
 
 /**
+ * Apply the live overlay to a throwaway copy of a step's durable state. The
+ * copy is what makes the overlay idempotent: the status prompt re-queries the
+ * same step every animation tick (~20 fps), and re-applying the buffered chunks
+ * to the durable state would re-enter their buckets on every render, inflating
+ * elapsed time faster the longer the step streams.
+ * @param state - The step's durable timing state, read but never mutated.
+ * @param live - Live chunks published for the step, in publication order.
+ * @returns The input state when it has no live overlay, else an overlaid copy.
+ */
+function withLiveChunks(
+  state: TimingState,
+  live: readonly LiveTimedChunk[] | undefined,
+): TimingState {
+  if (live === undefined || live.length === 0) return state
+  const overlaid: TimingState = {
+    totals: { ...state.totals },
+    active: state.active === undefined ? undefined : { ...state.active },
+  }
+  advanceLiveChunks(overlaid, live)
+  return overlaid
+}
+
+/**
  * Advance one step's timing from a single durable stream chunk, replacing the
  * old live `assistant/chunk` event. The first token leaves the pre-first-token
  * wait; reasoning content accrues to the thinking bucket, text/reasoning block
@@ -239,7 +262,9 @@ export class LiveTimingBuffer {
  * length` contract). Event times are consumed as logged: a backward wall-clock
  * step clamps each bucket at zero rather than cutting the scan off at the
  * query clock. The open bucket is accumulated to the query clock at lookup,
- * never during the scan.
+ * never during the scan. Live in-flight chunks are folded onto a copy for the
+ * same reason: a query is idempotent, so the ~20 fps status tick cannot
+ * re-enter a buffered chunk's bucket and inflate the elapsed time.
  */
 export class StepTimingTracker {
   private scanned = 0
@@ -278,11 +303,13 @@ export class StepTimingTracker {
         }
       }
     }
-    const state = this.steps.get(stepKey(position))
-    if (state === undefined) return emptyTimingTotals()
-    // Live chunks accrue on top of the replayed log only while the step is open;
-    // the durable settlement drops them, so a chunk is never counted twice.
-    if (!state.closed && live !== undefined) advanceLiveChunks(state, live(position))
+    const tracked = this.steps.get(stepKey(position))
+    if (tracked === undefined) return emptyTimingTotals()
+    // Live chunks accrue on top of the replayed log only while the step is open,
+    // and only on a copy: this query runs on every animation tick, so folding the
+    // overlay into the durable state would count the same chunks again on each
+    // render. The durable settlement drops them, so a chunk is never counted twice.
+    const state = tracked.closed ? tracked : withLiveChunks(tracked, live?.(position))
     return timingTotalsAt(state, at)
   }
 }

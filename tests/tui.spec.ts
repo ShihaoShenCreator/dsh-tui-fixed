@@ -2644,6 +2644,54 @@ describe('pi-tui chat lifecycle and transcript', () => {
     }
   })
 
+  it('keeps the live timing footer stable across animation ticks', async () => {
+    // The status prompt re-renders every 50 ms while a turn runs. Live chunks
+    // span more than one phase once the answer starts, and folding the buffered
+    // overlay into the step's durable state on each render used to re-add every
+    // recorded phase span, so `Thinking` started racing upward a couple of
+    // seconds into the step. Each render must show the same elapsed time.
+    let now = 1_700_000_000_000
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const intervals = vi.spyOn(globalThis, 'setInterval')
+    let result: Awaited<ReturnType<typeof setup>> | undefined
+    try {
+      const startedAt = now
+      result = await setup({ status: 'running', now: () => now })
+      const refresh = intervals.mock.calls.find(([, interval]) => interval === 50)?.[0]
+      if (typeof refresh !== 'function') throw new Error('TUI did not register its running-status refresh interval')
+      // Reasoning opens at +1s and the answer starts at +2s; both are buffered
+      // live chunks because the durable stream only lands at settlement.
+      emitLiveChunk(result.ctx, result.agent, 0, startedAt + 1_000, {
+        type: 'block-start', index: 0, blockType: 'reasoning',
+      })
+      emitLiveChunk(result.ctx, result.agent, 1, startedAt + 2_000, {
+        type: 'text-delta', index: 1, text: 'answering',
+      })
+      now = startedAt + 3_000
+      const frame = async (): Promise<string> => {
+        result!.terminal.output = ''
+        refresh()
+        // The diffing terminal elides an unchanged row; a full redraw exposes
+        // what this render actually resolved the timing footer to.
+        result!.terminal.send('\x0c')
+        await tick()
+        return result!.terminal.output
+      }
+      // The first render is correct under both implementations.
+      expect(await frame()).toContain('Thinking 1.0s')
+      // A second render at the same clock must not add the spans again.
+      expect(await frame()).toContain('Model wait 1.0s · Thinking 1.0s · Response 1.0s')
+      expect(await frame()).not.toContain('Thinking 2.0s')
+      // The tick still advances the open bucket with the wall clock.
+      now = startedAt + 4_000
+      expect(await frame()).toContain('Thinking 1.0s · Response 2.0s')
+    } finally {
+      if (result !== undefined) await dispose(result)
+      intervals.mockRestore()
+      nowSpy.mockRestore()
+    }
+  })
+
   it('shows minutes and seconds in accumulated timing', async () => {
     let clock = 1_700_000_000_000
     const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock)
@@ -6819,6 +6867,15 @@ describe('banner sweep reveal', () => {
     expect(result.terminal.output).toContain('\x1b[38;2;77;107;254m')
     expect(result.terminal.output).toContain('\x1b[38;2;36;152;255m')
     expect(result.terminal.output).toContain('HARNESS')
+    await dispose(result)
+  })
+
+  it('paints the product name in the brand role when truecolor is unavailable', async () => {
+    // Without 24-bit support the gradient is impossible, so the product name
+    // falls back to the brand role (ANSI 34) rather than the accent role: the
+    // accent (ANSI 95, bright magenta) is a theme emphasis color, not brand ink.
+    const result = await setup({ config: { theme: { color: true } } })
+    expect(result.terminal.output).toContain('\x1b[1m\x1b[34mDEEPSEEK\x1b[39m\x1b[22m')
     await dispose(result)
   })
 

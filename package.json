@@ -36,10 +36,7 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/index.js",
-    "lib/invariant.js",
-    "lib/prompt.js",
-    "lib/startup.js",
+    "lib/*.js",
     "lib/types/**/*.d.ts",
     "lib/types/**/*.d.ts.map",
     "src",

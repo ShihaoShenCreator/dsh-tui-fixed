@@ -115,4 +115,51 @@ describe('StepTimingTracker', () => {
       ttft: 100, thinking: 200, responding: 150, tools: 250,
     })
   })
+
+  it('keeps the live overlay idempotent across repeated renders of the same clock', () => {
+    // The status prompt re-queries the open step every animation tick (~20 fps),
+    // so a live chunk must contribute its span once per clock, not once per
+    // render.
+    const tracker = new StepTimingTracker()
+    const events = [
+      { type: 'step/start', seq: 0, time: 1_000, data: { turn: 1, step: 1 } },
+    ] as SessionEvent[]
+    const live = [
+      { time: 1_500, chunk: { type: 'block-start', index: 0, blockType: 'reasoning' } as StreamChunk },
+      { time: 2_500, chunk: { type: 'text-delta', index: 1, text: 'answer' } as StreamChunk },
+    ]
+    const lookup = (): typeof live => live
+    const first = tracker.totalsAt(events, { turn: 1, step: 1 }, 3_000, lookup)
+    expect(first).toEqual({ ttft: 500, thinking: 1_000, responding: 500, tools: 0 })
+    for (let render = 0; render < 5; render += 1) {
+      expect(tracker.totalsAt(events, { turn: 1, step: 1 }, 3_000, lookup)).toEqual(first)
+    }
+    // The open bucket still advances with the wall clock between ticks.
+    expect(tracker.totalsAt(events, { turn: 1, step: 1 }, 3_400, lookup))
+      .toEqual({ ttft: 500, thinking: 1_000, responding: 900, tools: 0 })
+    // A single query on a fresh tracker sees the same overlay.
+    expect(new StepTimingTracker().totalsAt(events, { turn: 1, step: 1 }, 3_000, lookup)).toEqual(first)
+  })
+
+  it('drops the live overlay without polluting the durable totals', () => {
+    const tracker = new StepTimingTracker()
+    const live = [
+      { time: 1_500, chunk: { type: 'block-start', index: 0, blockType: 'reasoning' } as StreamChunk },
+      { time: 2_500, chunk: { type: 'text-delta', index: 1, text: 'answer' } as StreamChunk },
+    ]
+    const events = [
+      { type: 'step/start', seq: 0, time: 1_000, data: { turn: 1, step: 1 } },
+    ] as SessionEvent[]
+    // Render the in-flight attempt several times before settlement.
+    for (let render = 0; render < 3; render += 1) {
+      expect(tracker.totalsAt(events, { turn: 1, step: 1 }, 3_000, () => live))
+        .toEqual({ ttft: 500, thinking: 1_000, responding: 500, tools: 0 })
+    }
+    events.push(messageEvent(1, 1, 1, 3_000, live))
+    // Settlement drops the overlay: the durable stream alone owns the step.
+    const settled = tracker.totalsAt(events, { turn: 1, step: 1 }, 3_000, () => undefined)
+    expect(settled).toEqual({ ttft: 500, thinking: 1_000, responding: 500, tools: 0 })
+    expect(new StepTimingTracker().totalsAt(events, { turn: 1, step: 1 }, 3_000))
+      .toEqual(settled)
+  })
 })
